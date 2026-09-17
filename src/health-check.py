@@ -77,6 +77,7 @@ from sutando_config import resolve_core_runtime, resolve_down_bridge_action  # n
 import process_pins  # noqa: E402
 import watcher_identity  # noqa: E402
 from cron_entry_digest import digest_map, drifted  # noqa: E402
+from cron_ownership import CORE as CRON_CORE, entry_owner  # noqa: E402
 from gateway_serving import (  # noqa: E402
     read_verdict as read_gateway_verdict,
     safe_num as _gateway_num,
@@ -1265,6 +1266,10 @@ def check_session_cron_registration(
 
     def session_owned(entry: dict) -> bool:
         if entry.get("launchd") is True or entry.get("execution") == "codex-task":
+            return False
+        if entry_owner(entry) != CRON_CORE:
+            # Worker-pinned entries register via that worker's own /startup,
+            # not here — counting them would warn forever.
             return False
         cron_expr = entry.get("cron")
         if entry.get("loop") == "dynamic" or not cron_expr:
