@@ -38,6 +38,7 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "src"))
 
 from delivery.task_dispatch import (  # noqa: E402
+    clear_inflight, inflight_is_live, mark_inflight,
     _main,
     find_ready_result,
     find_ready_result_for_filename,
@@ -654,6 +655,110 @@ class CliSmokeTest(unittest.TestCase):
                                   capture_output=True, text=True, timeout=30)
         self.assertEqual((ok.returncode, ok.stdout), (0, f"{results / 'task-a.txt'}\n"))
         self.assertEqual(miss.returncode, 1, miss.stderr)
+
+
+
+class InflightRecordTest(unittest.TestCase):
+    """The at-most-once record between a confirmed submit and a ready result."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name) / "inflight"
+
+    def test_a_marker_is_live_for_its_own_incarnation_only(self):
+        mark_inflight(self.dir, "task-a.txt", "4242")
+        self.assertTrue(inflight_is_live(self.dir, "task-a.txt", "4242"))
+        self.assertFalse(inflight_is_live(self.dir, "task-a.txt", "9999"), "a marker from another core held")
+        self.assertFalse((self.dir / "task-a.txt").exists(), "the stale marker was not removed")
+
+    def test_an_unreadable_current_incarnation_keeps_the_marker_live(self):
+        mark_inflight(self.dir, "task-a.txt", "4242")
+        self.assertTrue(inflight_is_live(self.dir, "task-a.txt", ""))
+        self.assertTrue((self.dir / "task-a.txt").exists())
+
+    def test_a_blank_marker_already_on_disk_is_corrupt_not_live(self):
+        self.dir.mkdir(parents=True)
+        (self.dir / "task-z.txt").write_text("\n")
+        self.assertFalse(inflight_is_live(self.dir, "task-z.txt", "4242"))
+        self.assertFalse((self.dir / "task-z.txt").exists(), "the corrupt marker was left to hold the task")
+        (self.dir / "task-z.txt").write_text("")
+        self.assertFalse(inflight_is_live(self.dir, "task-z.txt", ""), "blank against unreadable must not read as live")
+
+    def test_no_marker_is_not_live_and_clear_is_idempotent(self):
+        self.assertFalse(inflight_is_live(self.dir, "task-a.txt", "4242"))
+        clear_inflight(self.dir, "task-a.txt")
+        mark_inflight(self.dir, "task-a.txt", "4242")
+        clear_inflight(self.dir, "task-a.txt")
+        self.assertFalse(inflight_is_live(self.dir, "task-a.txt", "4242"))
+
+    def test_whitespace_in_a_filename_is_identity(self):
+        mark_inflight(self.dir, "task-a b.txt", "4242")
+        self.assertFalse(inflight_is_live(self.dir, "task-ab.txt", "4242"))
+
+    def test_traversal_names_are_refused(self):
+        for bad in ("", "../x.txt", "a/b.txt"):
+            with self.assertRaises(ValueError):
+                mark_inflight(self.dir, bad, "1")
+
+    def test_an_empty_incarnation_is_refused_by_the_writer_and_the_cli(self):
+        with self.assertRaises(ValueError):
+            mark_inflight(self.dir, "task-e.txt", "  ")
+        self.assertFalse((self.dir / "task-e.txt").exists())
+        self.assertEqual(2, _main(["inflight-mark", str(self.dir), "task-e.txt", ""]))
+
+    def test_concurrent_writers_never_race_on_a_shared_temp_path(self):
+        import threading
+        errors = []
+        def _w(i):
+            try:
+                mark_inflight(self.dir, "task-c.txt", str(i))
+            except Exception as exc:  # noqa: BLE001 - the point is that none happens
+                errors.append(repr(exc))
+        threads = [threading.Thread(target=_w, args=(i,)) for i in range(128)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        self.assertEqual([], errors)
+        self.assertTrue((self.dir / "task-c.txt").read_text().strip().isdigit())
+        self.assertEqual([], list(self.dir.glob(".task-c.txt.*")), "a temp file was left behind")
+
+    def test_cli_arms_in_process(self):
+        # The subprocess round trip proves the exit codes; this hits the same arms
+        # under the coverage tracer.
+        self.assertEqual(1, _main(["inflight-live", str(self.dir), "task-p.txt", "1"]))
+        self.assertEqual(0, _main(["inflight-mark", str(self.dir), "task-p.txt", "1"]))
+        self.assertEqual(0, _main(["inflight-live", str(self.dir), "task-p.txt", "1"]))
+        self.assertEqual(1, _main(["inflight-live", str(self.dir), "task-p.txt", "2"]))
+        self.assertEqual(0, _main(["inflight-clear", str(self.dir), "task-p.txt"]))
+        self.assertEqual(2, _main(["inflight-mark", str(self.dir), "task-p.txt"]))
+        self.assertEqual(2, _main(["inflight-mark", str(self.dir), "../x.txt", "1"]))
+        self.assertEqual(2, _main(["inflight-clear", str(self.dir), "task-p.txt", "extra"]))
+
+    def test_an_unreadable_marker_is_cannot_decide_not_absent(self):
+        import os as _os
+        if _os.geteuid() == 0:
+            self.skipTest("root cannot be denied a read")
+        mark_inflight(self.dir, "task-u.txt", "1")
+        (self.dir / "task-u.txt").chmod(0o000)
+        try:
+            with self.assertRaises(PermissionError):
+                inflight_is_live(self.dir, "task-u.txt", "1")
+            self.assertEqual(2, _main(["inflight-live", str(self.dir), "task-u.txt", "1"]))
+        finally:
+            (self.dir / "task-u.txt").chmod(0o644)
+        self.assertEqual(0, _main(["inflight-live", str(self.dir), "task-u.txt", "1"]), "readable again, it is live")
+
+    def test_cli_round_trip(self):
+        script = Path(__file__).resolve().parent.parent / "src" / "delivery" / "task_dispatch.py"
+        def run(*args):
+            return subprocess.run([sys.executable, str(script), *args], capture_output=True, text=True)
+        self.assertEqual(1, run("inflight-live", str(self.dir), "task-c.txt", "1").returncode)
+        self.assertEqual(0, run("inflight-mark", str(self.dir), "task-c.txt", "1").returncode)
+        self.assertEqual(0, run("inflight-live", str(self.dir), "task-c.txt", "1").returncode)
+        self.assertEqual(1, run("inflight-live", str(self.dir), "task-c.txt", "2").returncode)
+        self.assertEqual(0, run("inflight-clear", str(self.dir), "task-c.txt").returncode)
+        self.assertEqual(2, run("inflight-mark", str(self.dir), "task-c.txt").returncode, "arity is checked")
+        self.assertEqual(2, run("inflight-mark", str(self.dir), "../x.txt", "1").returncode)
 
 
 if __name__ == "__main__":
