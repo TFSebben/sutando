@@ -6,6 +6,10 @@ set -euo pipefail
 REPO="$(cd "$(dirname "$0")/../../../.." && pwd)"
 TMUX_SOCKET="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
 SESSION="${SUTANDO_TMUX_SESSION:-sutando-core}"
+# The core's window in that session; a heal may place it off index 0.
+CORE_WINDOW="${SUTANDO_TMUX_WINDOW:-0}"
+# The pane itself when the launcher named it: an index can be reused, a pane id cannot.
+TARGET="${SUTANDO_TMUX_PANE:-$SESSION:$CORE_WINDOW}"
 if [ -n "${SUTANDO_TASKS_DIR:-}" ]; then
   TASKS_DIR="${SUTANDO_TASKS_DIR/#\~/$HOME}"
 else
@@ -17,6 +21,8 @@ WORKSPACE_DIR="${SUTANDO_WORKSPACE_DIR:-$(dirname "$TASKS_DIR")}"
 RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 # Same base + suffix as watch-tasks-stream.sh's own CLAIMS_DIR.
 CLAIMS_DIR="$WORKSPACE_DIR/state/task-event-handler-claims"
+# The pool router's hand-off sentinels (task_dispatch.worker_holds); a routed task stays in tasks/.
+DELIVERIES_DIR="$WORKSPACE_DIR/deliveries"
 # Durable at-most-once record of a submitted prompt, per core incarnation.
 INFLIGHT_DIR="$WORKSPACE_DIR/state/task-notifier-inflight"
 # shellcheck source=../../../../scripts/python-binary.sh
@@ -117,7 +123,7 @@ next_pending_task() {
     return 0
   done < <(
     "$NOTIFIER_PY" "$DISPATCH_PY" pending-candidates "$TASKS_DIR" "$RESULTS_DIR" \
-      --claims-dir "$CLAIMS_DIR"
+      --claims-dir "$CLAIMS_DIR" --deliveries-dir "$DELIVERIES_DIR"
   )
   return 1
 }
@@ -166,7 +172,7 @@ pane_text_composer_is_empty() {
 
 core_pane_is_healthy() {
   local pane
-  pane="$(tmux -S "$TMUX_SOCKET" capture-pane -p -J -t "$SESSION:0" 2>/dev/null)" || return 1
+  pane="$(tmux -S "$TMUX_SOCKET" capture-pane -p -J -t "$TARGET" 2>/dev/null)" || return 1
   pane_text_is_healthy "$pane"
 }
 
@@ -176,13 +182,21 @@ core_is_healthy() {
   core_pane_is_healthy
 }
 
+# The exact pane, not the session: a sibling window can outlive the core. tmux
+# answers a dead pane in a live session with rc 0 and a BLANK id, so the id must
+# be non-empty and, when a pane was declared, that exact pane.
+target_pane_is_live() {
+  local id
+  id="$(tmux -S "$TMUX_SOCKET" display-message -p -t "$TARGET" '#{pane_id}' 2>/dev/null)" || return 1
+  [ -n "$id" ] || return 1
+  [ -z "${SUTANDO_TMUX_PANE:-}" ] || [ "$id" = "$SUTANDO_TMUX_PANE" ]
+}
+
 wait_for_core_healthy() {
   local started
   started="$(date +%s)"
   while ! core_is_healthy; do
-    if ! tmux -S "$TMUX_SOCKET" has-session -t "=$SESSION" 2>/dev/null; then
-      return 1
-    fi
+    target_pane_is_live || return 1
     if [ $(( $(date +%s) - started )) -ge "$CORE_READY_TIMEOUT" ]; then
       log_notifier "core did not become healthy within ${CORE_READY_TIMEOUT}s"
       return 1
@@ -195,7 +209,7 @@ wait_for_core_healthy() {
 # the global option can move without it), never `show-options -g`. Empty on failure.
 pane_history_field() {
   local v
-  v="$(tmux -S "$TMUX_SOCKET" display-message -p -t "$SESSION:0" "#{$1}" 2>/dev/null)"
+  v="$(tmux -S "$TMUX_SOCKET" display-message -p -t "$TARGET" "#{$1}" 2>/dev/null)"
   case "$v" in ''|*[!0-9]*) printf '' ;; *) printf '%s' "$v" ;; esac
 }
 
@@ -210,7 +224,7 @@ effective_scrollback_lines() {
 # Scrollback (-S), not just the visible screen: a wrapped prompt taller than
 # the pane pushes its marker off-screen, past what any `tail` can recover.
 capture_raw() {
-  tmux -S "$TMUX_SOCKET" capture-pane -p -J -S "-$(effective_scrollback_lines)" -t "$SESSION:0" 2>/dev/null
+  tmux -S "$TMUX_SOCKET" capture-pane -p -J -S "-$(effective_scrollback_lines)" -t "$TARGET" 2>/dev/null
 }
 
 capture_tail() {
@@ -220,7 +234,7 @@ capture_tail() {
 # The visible screen only: a banner is live when it is on screen, and an error
 # that scrolled off is history however small the pane.
 capture_view_esc() {
-  tmux -S "$TMUX_SOCKET" capture-pane -p -e -J -t "$SESSION:0" 2>/dev/null
+  tmux -S "$TMUX_SOCKET" capture-pane -p -e -J -t "$TARGET" 2>/dev/null
 }
 
 strip_sgr() {
@@ -324,7 +338,7 @@ deliver_prompt() {
       log_notifier "composer not empty for $filename; leaving it queued (failing closed, not typing over a draft)"
       return 1
     fi
-    tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION:0" -l -- "$prompt"
+    tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" -l -- "$prompt"
     sleep "$POLL_INTERVAL"
     staged_raw="$(capture_raw)"
     if prompt_is_staged "$staged_raw" "$prompt"; then staged=1; break; fi
@@ -368,7 +382,7 @@ press_enter_and_confirm() {
     log_notifier "could not record the in-flight marker for $filename; not pressing Enter (failing closed)"
     return 1
   fi
-  tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION:0" C-m
+  tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" C-m
   while :; do
     waited=0
     while [ "$waited" -lt "$SUBMIT_CONFIRM_TIMEOUT" ]; do
@@ -398,7 +412,7 @@ press_enter_and_confirm() {
       return 1
     fi
     log_notifier "prompt still staged after C-m for $filename; re-pressing (attempt $((attempt + 1))/$SUBMIT_RETRIES)"
-    tmux -S "$TMUX_SOCKET" send-keys -t "$SESSION:0" C-m
+    tmux -S "$TMUX_SOCKET" send-keys -t "$TARGET" C-m
   done
 }
 
@@ -414,7 +428,7 @@ staged_prompt_is_ambiguous() {
   while IFS= read -r other; do
     [ "$other" = "$filename" ] && continue
     prompt_is_staged "$raw" "$(task_prompt "$other")" && return 0
-  done < <("$NOTIFIER_PY" "$DISPATCH_PY" pending-candidates "$TASKS_DIR" "$RESULTS_DIR" --claims-dir "$CLAIMS_DIR" 2>/dev/null || true)
+  done < <("$NOTIFIER_PY" "$DISPATCH_PY" pending-candidates "$TASKS_DIR" "$RESULTS_DIR" --claims-dir "$CLAIMS_DIR" --deliveries-dir "$DELIVERIES_DIR" 2>/dev/null || true)
   return 1
 }
 
