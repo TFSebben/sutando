@@ -26,6 +26,7 @@ CLI:
     python3 src/delivery/pane_gate.py classify --runtime codex [--json] < capture.txt
     python3 src/delivery/pane_gate.py pending  --runtime codex < capture.txt
     python3 src/delivery/pane_gate.py composer-text --runtime claude < capture.txt
+    python3 src/delivery/pane_gate.py healthy --runtime claude < capture.txt   # exit 0 = accepts input
     python3 src/delivery/pane_gate.py deliver <session> <line> --runtime codex
         [--socket PATH] [--refuse-if-pending] [--skip-if-queued WORD] [--dry-run]
 """
@@ -44,7 +45,7 @@ from typing import Callable, List, Optional, Tuple
 
 _SRC = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_SRC))
-from cli_wedge import capture_pane, core_target, matched_abnormal  # noqa: E402
+from cli_wedge import capture_pane, core_target, live_banner_lines, matched_abnormal  # noqa: E402
 
 REPO = _SRC.parent
 SEND_LINE = REPO / "scripts" / "tmux-send-line.sh"
@@ -283,10 +284,15 @@ def _gate(capture: str, tail: str, line: Optional[PromptLine], adapter: RuntimeA
     case -- everything below the current prompt line -- before trusting the composer."""
     if line is not None and not line.text:
         following = after_prompt(capture, adapter)
-        if not following.strip() or not adapter.await_hint.search(following):
+        # A live pane draws its footer last, so text after the LAST footer line is
+        # newer than the footer: a dialog there is live even under a trailing glyph.
+        footer_hits = list(adapter.idle_ready.finditer(tail))
+        beyond_footer = tail[footer_hits[-1].end():] if footer_hits else ""
+        newer = "\n".join(part for part in (following, beyond_footer) if part.strip())
+        if not newer or not adapter.await_hint.search(newer):
             return None
         for kind, rx in adapter.gate_signatures:
-            if rx.search(following):
+            if rx.search(newer):
                 return kind
         # An await hint we cannot name is an UNRECOGNISED dialog, not the absence of one.
         # Falling through to "no gate" let a stale empty composer vouch for a live dialog.
@@ -299,6 +305,28 @@ def _gate(capture: str, tail: str, line: Optional[PromptLine], adapter: RuntimeA
     return None
 
 
+def banner_abnormal_names(tail: str) -> List[str]:
+    """cli_wedge's whole-line banner families -- the only reader of a live
+    "Retrying in Ns" line. The retry family outranks everything; the parked
+    family waits for the gate signatures, since its quota-limit line also
+    matches the Fable-consent dialog, which is a named gate first."""
+    names: List[str] = []
+    for family, name, _line in live_banner_lines(tail):
+        tag = f"{family}:{name}" if family == "retry" else name
+        if tag not in names:
+            names.append(tag)
+    return names
+
+
+# A working turn queues typed input (the Claude notifier delivers like the Monitor
+# tool); a dialog, a parked banner or an unreadable pane does not.
+def accepts_input(verdict: Verdict) -> bool:
+    """True when a line typed now reaches the composer: idle, a draft, or a running turn."""
+    if verdict.state in ("idle-ready", "pending"):
+        return True
+    return verdict.state == "busy" and verdict.reason == "working"
+
+
 def classify_pane(capture: Optional[str], adapter: RuntimeAdapter) -> Verdict:
     """One verdict for a captured pane. A failed or empty capture is UNKNOWN, never idle."""
     if capture is None:
@@ -307,6 +335,11 @@ def classify_pane(capture: Optional[str], adapter: RuntimeAdapter) -> Verdict:
         return Verdict("unknown", "empty pane")
     lines = _tail_lines(capture)
     tail = "\n".join(_SGR.sub("", ln) for ln in lines)
+    # A retry is abnormal even mid-turn: the interrupt affordance stays up while
+    # the CLI retries, and a line typed then queues into a turn that is not served.
+    retrying = [t for t in banner_abnormal_names(tail) if t.startswith("retry:")]
+    if retrying:
+        return Verdict("abnormal", ",".join(retrying))
     if adapter.busy.search(tail):
         return Verdict("busy", "working")
     abnormal = matched_abnormal([tail])
@@ -321,6 +354,9 @@ def classify_pane(capture: Optional[str], adapter: RuntimeAdapter) -> Verdict:
     gate = _gate(capture, tail, line, adapter)
     if gate:
         return Verdict("busy", gate)
+    banner = banner_abnormal_names(tail)
+    if banner:
+        return Verdict("abnormal", ",".join(banner))
     if line is not None and line.text:
         return Verdict("pending", "text at the prompt", line.text)
     if adapter.idle_ready.search(tail) or (line is not None and line.placeholder):
@@ -386,6 +422,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             p.add_argument("--json", action="store_true")
     ct = sub.add_parser("composer-text")
     ct.add_argument("--runtime", required=True, choices=sorted(ADAPTERS))
+    hp = sub.add_parser("healthy")
+    hp.add_argument("--runtime", required=True, choices=sorted(ADAPTERS))
     d = sub.add_parser("deliver")
     d.add_argument("session")
     d.add_argument("line")
@@ -413,6 +451,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("pane_gate: no prompt line found — prompt unknown", file=sys.stderr)
             return EXIT_UNSAFE
         print(text)
+        return 0
+    if a.cmd == "healthy":
+        # The notifier's pre-typing question, answered by the same verdict every
+        # caller gets: exit 0 when typed input reaches the composer, else refuse.
+        v = classify_pane(_read_stdin(), adapter)
+        if not accepts_input(v):
+            print(f"pane_gate: {v.state} ({v.reason}) — not accepting input", file=sys.stderr)
+            return EXIT_UNSAFE
+        print(v.state)
         return 0
     if a.cmd == "composer-text":
         # Same None/"" contract as "pending", via the frame-stripping parser
