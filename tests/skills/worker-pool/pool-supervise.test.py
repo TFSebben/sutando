@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[3]
@@ -258,6 +259,95 @@ class ItNeverRemedies(Base):
         self.assertEqual(len(wi.incarnations(self.ws, wid)), 1, "it started a run")
 
 
+class IsThisHostRouting(Base):
+    """Bindings say tasks must reach workers; only the handler's receipt says the
+    watcher ever consults it. The gap between the two is a host whose core answers
+    for its workers, silently."""
+
+    def _bind(self):
+        wid = make_worker(self.ws)
+        pr.bind_room(self.ws, "!room:ag2.space", wid)
+        return wid
+
+    def _archived_task(self, mtime):
+        d = self.ws / "tasks" / "archive"
+        d.mkdir(parents=True, exist_ok=True)
+        f = d / "task-abc.txt"
+        f.write_text("id: task-abc\ntask: x\n")
+        import os
+        os.utime(f, (mtime, mtime))
+        return f
+
+    def test_no_bindings_is_never_an_alarm(self):
+        make_worker(self.ws)
+        self.assertIsNone(sup.routing_status(self.ws)["alarm"])
+
+    def test_bound_rooms_but_a_handler_never_consulted_is_the_alarm(self):
+        self._bind()
+        self._archived_task(1000.0)
+        st = sup.routing_status(self.ws)
+        self.assertEqual(st["bound_rooms"], ["!room:ag2.space"])
+        self.assertIsNone(st["handler_consulted_at"])
+        self.assertIn("never been consulted", st["alarm"] or "")
+
+    def test_a_task_that_arrived_after_the_last_consult_is_the_alarm(self):
+        self._bind()
+        sup.prr.record(self.ws, mode="probe", task_id="task-old", now=1000.0)
+        self._archived_task(2000.0)
+        self.assertIn("processed it unrouted", sup.routing_status(self.ws)["alarm"] or "")
+
+    def test_a_consult_newer_than_every_task_is_quiet(self):
+        self._bind()
+        self._archived_task(1000.0)
+        sup.prr.record(self.ws, mode="run", task_id="task-abc", now=1001.0)
+        st = sup.routing_status(self.ws)
+        self.assertIsNone(st["alarm"])
+        self.assertEqual(st["handler_consulted_at"], 1001.0)
+
+    def test_a_corrupt_receipt_is_no_evidence(self):
+        self._bind()
+        sup.prr.receipt_path(self.ws).parent.mkdir(parents=True, exist_ok=True)
+        sup.prr.receipt_path(self.ws).write_text("{not json")
+        self.assertIn("never been consulted", sup.routing_status(self.ws)["alarm"] or "")
+
+    def test_a_well_formed_receipt_of_the_wrong_shape_is_no_evidence_either(self):
+        # The shape a half-written or schema-drifted receipt actually has: it parses,
+        # but `consulted_at` is not a number (or the document is not an object).
+        self._bind()
+        path = sup.prr.receipt_path(self.ws)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        for bad in ('{"consulted_at": "07:20"}', "[]", '{"mode": "probe"}'):
+            path.write_text(bad)
+            self.assertIsNone(sup.prr.read(self.ws), bad)
+            self.assertIn("never been consulted", sup.routing_status(self.ws)["alarm"] or "", bad)
+
+    def test_an_archived_task_that_cannot_be_stated_is_skipped_not_fatal(self):
+        self._bind()
+        self._archived_task(1000.0)
+        sup.prr.record(self.ws, mode="run", task_id="task-abc", now=2000.0)
+        real = Path.stat
+
+        def flaky(self_, *a, **k):
+            if self_.name == "task-abc.txt":
+                raise OSError(5, "Input/output error")
+            return real(self_, *a, **k)
+        with patch.object(Path, "stat", flaky):
+            st = sup.routing_status(self.ws)
+        self.assertIsNone(st["newest_task_at"], "an unreadable task must not become a timestamp")
+        self.assertIsNone(st["alarm"])
+
+    def test_the_sweep_prints_the_alarm_and_carries_it_in_json(self):
+        self._bind()
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            sup.main(["--workspace", str(self.ws), "--sweep", "--no-persist"])
+        self.assertIn("unrouted:", out.getvalue())
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            sup.main(["--workspace", str(self.ws), "--sweep", "--no-persist", "--json"])
+        self.assertIn("never been consulted", json.loads(out.getvalue())["routing"]["alarm"])
+
+
 class TheCommandLine(Base):
     def _run(self, *argv):
         out, err = io.StringIO(), io.StringIO()
@@ -284,7 +374,7 @@ class TheCommandLine(Base):
         rc, out, _ = self._run("--recipient", wid, "--json", "--no-persist")
         self.assertEqual(rc, 0)
         self.assertEqual(set(json.loads(out)),
-                         {"decisions", "observations", "resumed", "not_supervised"})
+                         {"decisions", "observations", "resumed", "not_supervised", "routing"})
 
     def test_a_resume_sample_says_so(self):
         make_worker(self.ws)
