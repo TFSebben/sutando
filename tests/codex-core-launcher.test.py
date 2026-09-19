@@ -68,6 +68,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/agent/codex/cli/task-notifier-supervisor.sh",
             "src/agent/start-cli.sh",
             "src/agent/restart-guard.sh",
+            "src/agent/task-event-handler-lookup.sh",
             "src/file_lock.py",
             "src/delivery/__init__.py",
             "src/delivery/readiness.py",
@@ -213,7 +214,7 @@ exit 0
                 return
             time.sleep(0.01)
         self.fail(f"heartbeat stub pid {pid} did not exit")
-    def _notifier_version(self):
+    def _notifier_version(self, handler=""):
         first = subprocess.check_output([
             "cksum",
             str(self.root / "src/agent/codex/cli/task-notifier-supervisor.sh"),
@@ -222,7 +223,12 @@ exit 0
         ])
         checksum = subprocess.run(["cksum"], input=first, capture_output=True,
                                   check=True, text=False).stdout.decode().split()
-        return f"{checksum[0]}-{checksum[1]}"
+        # Matches the launcher's own formula, which now folds the resolved
+        # handler (empty here — this fixture publishes none) into the version.
+        handler_cksum = subprocess.run(
+            ["cksum"], input=handler.encode(), capture_output=True,
+            check=True, text=False).stdout.decode().split()[0]
+        return f"{checksum[0]}-{checksum[1]}-h{handler_cksum}"
 
     def run_launcher(self, *args, env_extra=None, launcher="src/agent/start-cli.sh"):
         env = dict(os.environ)
@@ -314,6 +320,26 @@ exit 0
             os.close(master)
             if slave >= 0:
                 os.close(slave)
+
+    def _install_pool_skill(self):
+        script = self.root / "skills" / "pool" / "scripts" / "route_handler.py"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("#!/bin/sh\nexit 0\n")
+        script.chmod(0o755)
+        link = self.root / "skills" / "pool" / "task-event-handler"
+        link.symlink_to("scripts/route_handler.py")
+        return link
+
+    def test_pool_route_handler_reaches_the_watcher_when_the_skill_is_present(self):
+        p = self._install_pool_skill()
+        result = self.run_launcher(launcher="src/agent/codex/cli/start-cli.sh")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"-e SUTANDO_TASK_EVENT_HANDLER={p}", self.log.read_text())
+
+    def test_no_pool_skill_sets_no_handler(self):
+        result = self.run_launcher(launcher="src/agent/codex/cli/start-cli.sh")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("SUTANDO_TASK_EVENT_HANDLER=", self.log.read_text())
 
     def test_launches_codex_and_managed_task_notifier(self):
         result = self.run_launcher(env_extra={
