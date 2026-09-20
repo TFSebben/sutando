@@ -42,9 +42,30 @@ def resolve_url(explicit: str | None) -> str:
     raise RoomDocError("no service URL. Pass --url, or set one of: " + ", ".join(URL_VARS) + ".")
 
 
+def parse_elements(raw: str) -> list:
+    """The `draw` argument, turned into elements or a readable refusal.
+
+    Left to json itself this raises JSONDecodeError and the CLI prints a
+    traceback, which no other error path here does.
+    """
+    try:
+        elements = json.loads(raw)
+    except ValueError as exc:
+        raise RoomDocError(
+            f"elements must be a JSON array, and this did not parse: {exc}\n"
+            'e.g. \'[{"id":"r1","type":"rectangle","x":0,"y":0,'
+            '"width":100,"height":60,"version":1}]\'') from exc
+    if not isinstance(elements, list):
+        raise RoomDocError(
+            f"elements must be a JSON ARRAY, got {type(elements).__name__}. "
+            "One element still goes in a list.")
+    return elements
+
+
 def render(command: str, *, text: str = "", peers: list | None = None,
            as_json: bool = False, before: int | None = None,
-           elements: list | None = None, written: int | None = None) -> str:
+           elements: list | None = None, written: int | None = None,
+           authors: dict | None = None) -> str:
     """What the CLI prints, decided without a socket in hand.
 
     Kept pure so the output contract is testable anywhere: a caller parsing
@@ -68,8 +89,17 @@ def render(command: str, *, text: str = "", peers: list | None = None,
             return json.dumps({"ok": True, "written": written, "count": len(elements)})
     if command == "read":
         if as_json:
-            return json.dumps({"chars": len(text), "peers": peers, "text": text},
-                              ensure_ascii=False, indent=2)
+            payload = {"chars": len(text), "peers": peers, "text": text}
+            if authors is not None:
+                payload["authors"] = authors
+            return json.dumps(payload, ensure_ascii=False, indent=2)
+        if authors:
+            # Named above the text, because an agent decides whether to trust
+            # or edit the content by WHO produced it.
+            lines = [f"{c}: {a.get('mxid','?')} ({a.get('kind','?')}"
+                     + (f", agent of {a['owner_mxid']}" if a.get("owner_mxid") else "") + ")"
+                     for c, a in sorted(authors.items())]
+            return "authors:\n  " + "\n  ".join(lines) + "\n\n" + text
         return text
     if command == "peers":
         return json.dumps(peers, ensure_ascii=False, indent=2)
@@ -94,9 +124,14 @@ async def run(args: argparse.Namespace) -> int:
             await doc.set_presence(args.name, user_id=args.user_id)
 
         if args.kind == BOARD_KIND:
+            # Presence is its own channel and belongs to no document kind, so
+            # `peers` is answered here exactly as it is for a text document.
+            if args.command == "peers":
+                print(render("peers", peers=doc.peers, as_json=args.json))
+                return 0
             written = None
             if args.command == "draw":
-                written = await doc.put_elements(json.loads(args.elements))
+                written = await doc.put_elements(parse_elements(args.elements))
                 await doc.settle(args.settle)
             elif args.command == "erase":
                 await doc.delete_element(args.element_id)
@@ -105,9 +140,10 @@ async def run(args: argparse.Namespace) -> int:
             elif args.command != "read":
                 raise RoomDocError(
                     f"{args.command!r} is a text command; the board holds elements. "
-                    "Use read, draw or erase.")
+                    "Use read, draw, erase or peers.")
             print(render(args.command, peers=doc.peers, as_json=args.json,
-                         elements=doc.elements, written=written))
+                         elements=doc.elements, written=written,
+                         authors=doc.authors if args.with_authors else None))
             return 0
 
         if args.command in ("draw", "erase"):
@@ -121,7 +157,8 @@ async def run(args: argparse.Namespace) -> int:
             await doc.replace(args.old, args.new)
             await doc.settle(args.settle)
         print(render(args.command, text=doc.text, peers=doc.peers,
-                     as_json=args.json, before=before))
+                     as_json=args.json, before=before,
+                     authors=doc.authors if args.with_authors else None))
     return 0
 
 
@@ -137,6 +174,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--insecure", action="store_true", help="skip TLS verification (local rig only)")
     p.add_argument("--settle", type=float, default=1.0, help="seconds to wait after a write")
     p.add_argument("--json", action="store_true", help="machine-readable output")
+    p.add_argument("--with-authors", dest="with_authors", action="store_true",
+                   help="also report who wrote with each Yjs client id")
     sub = p.add_subparsers(dest="command", required=True)
 
     for name, help_text in (("read", "print the document"), ("peers", "who is present")):
