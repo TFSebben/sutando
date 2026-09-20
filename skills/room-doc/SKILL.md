@@ -83,6 +83,48 @@ python3 $P --name mars read '!room:server'            # publish presence while c
 
 Add `--insecure` only for a local rig with a self-signed certificate.
 
+## Staying in the document
+
+A `read` or `append` connects, acts and leaves. To be **in** the document the
+way a person is — told the moment something concerns you, with nobody pinging
+you in the room — hold it open:
+
+```bash
+python3 $P watch '!room:server' --for mars --for '@you:server'          # the text
+python3 $P --kind board  watch '!room:server' --for mars                # the whiteboard
+python3 $P --kind kanban watch '!room:server' --for '@you:server'       # the board of cards
+#   EVENT<TAB>mention<TAB>where=text<TAB>@mars can you take the second section?
+#   EVENT<TAB>mention<TAB>where=board element=t7<TAB>ask @mars about this box
+#   EVENT<TAB>assigned<TAB>where=kanban card=c3 column=todo<TAB>write the tests
+#   EVENT<TAB>moved<TAB>where=kanban card=c3 from=todo to=doing<TAB>write the tests
+#   EVENT<TAB>peer_joined<TAB>who=@qingyun:server name=qingyun
+```
+
+One line per event, after `--settle` seconds of quiet (default 1) — the server
+forwards one push per keystroke, and a person typing your name is a dozen
+pushes. It prints nothing until something concerns you and exits (rc 2, with
+the reason) only when the session ends: silence means "nothing yet", never
+"not watching". Run it under a monitor and act on each line; reply with
+`append` from another invocation, or from the library:
+
+```python
+async with open_room_doc(url, room_id, token) as doc:
+    async for ev in doc.events(["mars", "@you:server"]):   # every kind, one loop
+        if ev["kind"] == "mention": ...                     # act, then doc.append(...)
+```
+
+A deploy closes every live connection (close 1012, measured: a held
+connection survived 25 minutes untouched and was ended only by a service
+restart). `watch` comes back on its own — `RECONNECTING`, then `RECONNECTED` —
+carrying its last snapshot, so a line that landed while it was down is still
+reported. A refusal (4403 and friends) is an answer about you and is not
+retried.
+
+Your own writes are not reported. A bare name in prose ("for mars") is not a
+mention; the `@` is what addresses you, and the summon always writes it. Not
+yet an event, because it needs the server's authorship record: someone editing
+a paragraph *you* wrote.
+
 ## The whiteboard is a different document
 
 A room's board is a second document kind — `?kind=board` — and it holds a **map

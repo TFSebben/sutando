@@ -202,6 +202,45 @@ async def doctor(args: argparse.Namespace) -> int:
     return 0
 
 
+
+async def watch(args: argparse.Namespace, token: str, url: str) -> int:
+    """Hold the document open and print one line per event that concerns
+    `--for`, as it lands. Comes back from a service restart with the last
+    snapshot in hand, so what landed meanwhile is reported, not skipped.
+    Exits (rc 2) only on a refusal or after --max-reconnects failures."""
+    from room_doc_client import open_room_doc
+    from room_doc_protocol import RECONNECT_CODES
+
+    handles = args.handles or []
+    since = None
+    failures = 0
+    print(f"watching {args.room} ({args.kind}) for {handles or 'nobody in particular'}; "
+          f"reporting after {args.settle}s of quiet", flush=True)
+    while True:
+        try:
+            async with open_room_doc(url, args.room, token, kind=args.kind,
+                                     insecure=args.insecure) as doc:
+                if args.name:
+                    await doc.set_presence(args.name, user_id=args.user_id)
+                if since is not None:
+                    print("RECONNECTED\tcatching up on what landed meanwhile", flush=True)
+                async for ev in doc.events(handles, settle=args.settle, since=since):
+                    failures = 0              # a socket that carries an event is a real one
+                    kind = ev.pop("kind")
+                    detail = ev.pop("text", None)
+                    rest = " ".join(f"{k}={v}" for k, v in ev.items() if v not in (None, ""))
+                    print(f"EVENT\t{kind}\t{rest}" + (f"\t{detail}" if detail else ""), flush=True)
+                return 0                      # a clean end is an end, not a reconnect
+        except RoomDocError as exc:
+            since = getattr(exc, "snapshot", since)
+            if exc.code not in RECONNECT_CODES or failures >= args.max_reconnects:
+                raise
+            failures += 1
+            wait = min(2 ** failures, 30)
+            print(f"RECONNECTING\tcode={exc.code} attempt={failures} in {wait}s", flush=True)
+            await asyncio.sleep(wait)
+
+
 async def run(args: argparse.Namespace) -> int:
     # Imported here, not at module scope: the rules above are pure, and a test
     # of them must not need pycrdt installed.
@@ -213,6 +252,9 @@ async def run(args: argparse.Namespace) -> int:
         return await doctor(args)
 
     token, url = resolve_token(args.token), resolve_url(args.url)
+    if args.command == "watch":
+        return await watch(args, token, url)
+
     async with open_room_doc(url, args.room, token, kind=args.kind,
                              insecure=args.insecure) as doc:
         if args.name:
@@ -282,6 +324,13 @@ def build_parser() -> argparse.ArgumentParser:
                             ("doctor", "check deps, credential, URL and connection, step by step")):
         s = sub.add_parser(name, help=help_text)
         s.add_argument("room", help="Matrix room id, e.g. !abc:server")
+
+    s = sub.add_parser("watch", help="hold the document open; print each event that concerns --for")
+    s.add_argument("room")
+    s.add_argument("--for", dest="handles", action="append", metavar="HANDLE",
+                   help="a name or @mxid to watch for (repeatable)")
+    s.add_argument("--max-reconnects", type=int, default=20,
+                   help="give up after this many consecutive failed reconnects")
 
     s = sub.add_parser("append", help="append text to the end")
     s.add_argument("room")
