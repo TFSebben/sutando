@@ -353,6 +353,39 @@ async def test_the_close_code_reaches_the_caller_with_the_last_snapshot():
         raise AssertionError("must raise")
 
 
+async def test_an_anchor_is_a_relative_position_pair_in_yjs_ids():
+    import base64
+    from pycrdt import StickyIndex
+    doc, rd = make()
+    text = doc.get(DEFAULT_TEXT_NAME, type=Text)
+    # Built in four transactions so the items are out of clock order; the
+    # expected IDs are the ones a Y.Doc resolves back to the same indexes.
+    text += "héllo"
+    text.insert(0, "¡")
+    text += "日本"
+    text.insert(3, "😀")
+    s = rd.text
+    assert s == "¡h😀éllo日本", s
+    me = doc.client_id
+
+    def decoded(b64):
+        return StickyIndex.decode(base64.b64decode(b64), sequence=text).to_json()
+
+    a = rd.anchor(s.index("日本"), s.index("日本") + 2)   # chars 7..9 = units 8..10
+    assert decoded(a["start"]) == {"item": {"client": me, "clock": 6}, "assoc": 0}, a
+    assert decoded(a["end"]) == {"tname": DEFAULT_TEXT_NAME, "assoc": 0}, a   # the end of the text
+    b = rd.anchor(s.index("éllo"), s.index("éllo") + 4)   # chars 3..7 = units 4..8, after the emoji
+    assert decoded(b["start"]) == {"item": {"client": me, "clock": 1}, "assoc": 0}, b
+    assert decoded(b["end"]) == {"item": {"client": me, "clock": 6}, "assoc": 0}, b
+
+    for bad in ((-1, 2), (3, 2), (0, len(s) + 1)):
+        try:
+            rd.anchor(*bad)
+            raise AssertionError(f"accepted {bad}")
+        except RoomDocError as e:
+            assert "outside the text" in str(e)
+
+
 def test_a_refusal_is_never_a_reconnect():
     from room_collab_protocol import close_code
     for refusal in (4400, 4403, 4404):

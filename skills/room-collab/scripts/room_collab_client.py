@@ -14,6 +14,7 @@ open is not enough — the renewal loop runs for as long as the session does.
 from __future__ import annotations
 
 import asyncio
+import base64
 import os
 import ssl
 import sys
@@ -29,6 +30,7 @@ try:
         create_awareness_message, create_sync_message, create_update_message,
         handle_sync_message, read_message,
     )
+    from room_collab_positions import encode as encode_position, units
 except ImportError as exc:  # pragma: no cover - import guard
     raise SystemExit(
         f"room-collab client needs its dependencies: {exc}\n"
@@ -133,6 +135,20 @@ class RoomDoc:
     def files(self) -> list[dict]:
         _, files = self._require_board("read files")
         return [v for k, v in self._items(files) if is_board_file(v, k)]
+
+    def anchor(self, start: int, end: int) -> dict[str, str]:
+        """Two Yjs relative positions, base64, for the character range
+        [start, end) of the text — the form a web client anchors a comment to,
+        which survives edits elsewhere in the document."""
+        text = self._require_text("anchor text")
+        current = self.text
+        if not 0 <= start <= end <= len(current):
+            raise RoomDocError(f"anchor range {start}:{end} is outside the text ({len(current)} chars)")
+        # Character offsets here; a Yjs position counts UTF-16 units.
+        return {"start": base64.b64encode(
+                    encode_position(self._doc, text, self._text_name, units(current[:start]))).decode("ascii"),
+                "end": base64.b64encode(
+                    encode_position(self._doc, text, self._text_name, units(current[:end]))).decode("ascii")}
 
     @property
     def peers(self) -> list[dict]:
