@@ -51,30 +51,36 @@ source "$__SCRIPT_DIR/task-emit.sh"
 source "$__SCRIPT_DIR/inbox-resolve.sh"
 # shellcheck source=agent/task-event-handler-lookup.sh
 source "$__SCRIPT_DIR/agent/task-event-handler-lookup.sh"
+# shellcheck source=tasks-dir-resolve.sh
+source "$__SCRIPT_DIR/tasks-dir-resolve.sh"
 __REPO_ROOT="$(cd "$__SCRIPT_DIR/.." && pwd)"
 
-# Resolve TASKS_DIR. Priority: explicit positional arg → canonical M0 loader.
-# Post-v0.8 (#1440 + Mini opinion-requested 2026-06-06) the legacy env-var
-# fallback and hardcoded pre-v0.8 default fallback are gone: the bridges
-# (discord-bridge.py, telegram-bridge.py, dm-result.py — see PRs
-# #708/#720/#722/#723) write to the resolved workspace, and if this watcher
-# diverged from that resolution owner DMs would land silently. Diagnosed
-# 2026-05-15 (~3 dropped DMs over 17 min) and again 2026-05-16 (~45 min
-# silent gap when the Monitor was started without the env var exported
-# into its env). Single resolution path = no divergence.
-if [ -n "${1:-}" ]; then
-  TASKS_DIR="$1"
-elif [ -n "${SUTANDO_TASKS_DIR:-}" ]; then
-  # An instance whose inbox is not <workspace>/tasks/ carries it in env, so the
-  # same `/startup` serves it with no argument change.
-  TASKS_DIR="$SUTANDO_TASKS_DIR"
-elif [ -f "$__REPO_ROOT/scripts/sutando-config.sh" ]; then
-  __WS="$(bash "$__REPO_ROOT/scripts/sutando-config.sh" workspace)"
-  TASKS_DIR="$__WS/tasks"
-else
+# --role/--inbox are stripped before the positional TASKS_DIR check below so a
+# tagged invocation (`watch-tasks-stream.sh /path --role session --inbox /path`)
+# still resolves its tasks dir the same as an untagged one. Logged to stderr
+# only, never into the sentinel: three readers int() that file as a bare pid
+# (watcher_sentinel.sh).
+WATCHER_ROLE=""
+WATCHER_INBOX_TAG=""
+__args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --role) WATCHER_ROLE="${2:-}"; shift 2 ;;
+    --role=*) WATCHER_ROLE="${1#--role=}"; shift ;;
+    --inbox) WATCHER_INBOX_TAG="${2:-}"; shift 2 ;;
+    --inbox=*) WATCHER_INBOX_TAG="${1#--inbox=}"; shift ;;
+    *) __args+=("$1"); shift ;;
+  esac
+done
+set -- "${__args[@]+"${__args[@]}"}"
+[ -n "$WATCHER_ROLE" ] && echo "watch-tasks-stream: role=$WATCHER_ROLE inbox=${WATCHER_INBOX_TAG:-<unset>} pid=$$" >&2
+
+# One resolver (tasks-dir-resolve.sh) for this watcher and the supervisor, so the
+# two can never name different inboxes: explicit arg -> SUTANDO_TASKS_DIR -> M0 loader.
+TASKS_DIR="$(resolve_tasks_dir "${1:-}" "$__REPO_ROOT")" || {
   echo "watch-tasks-stream: cannot resolve workspace — scripts/sutando-config.sh not found at \$__REPO_ROOT. Verify the sutando checkout is intact." >&2
   exit 1
-fi
+}
 mkdir -p "$TASKS_DIR"
 # Canonicalize watched dir for the parent-dir filter below. fswatch always
 # emits PHYSICAL paths (e.g. /private/tmp/... not /tmp/...), so we resolve
@@ -526,28 +532,9 @@ mkdir -p "$STATE_DIR"
 # Per instance: N watchers on one host each stamped the same file, so the
 # readers tracked only the newest. Unset $SUTANDO_INSTANCE keeps the old name.
 PID_FILE="$(sentinel_path_for "$STATE_DIR")"
-# In place, never write-elsewhere-then-mv: mv preserves mtime, and
-# sentinel_pid_wrote_file reads mtime as "when this watcher stamped".
-echo "$$" > "$PID_FILE"
-# The watcher beat, `state/watchers/<id>.alive` (docs/worker-pool-design.md). It is
-# handed this pid and exits when it dies: SIGKILL and a crash run no cleanup trap.
+# Stamped only once fswatch is confirmed up (below the launch): until then the
+# file may still name a live standby that this watcher must not displace.
 WATCHER_BEAT_PID=""
-# INJECTED, never located: a core helper may run a path it is handed but must not
-# find an optional skill itself (docs/architecture-boundaries.md). Unset = no beat.
-if [ -n "${SUTANDO_WATCHER_BEAT:-}" ] && [ -f "${SUTANDO_WATCHER_BEAT}" ]; then
-  "$SUTANDO_PY_BIN" "$SUTANDO_WATCHER_BEAT" --workspace "$WORKSPACE_DIR" \
-      --kind watcher --id "${SUTANDO_INSTANCE_ID:-core}" --parent-pid "$$" >/dev/null 2>&1 &
-  WATCHER_BEAT_PID=$!
-fi
-# PID-file cleanup is folded into the unified `cleanup` function below so a
-# single trap covers both responsibilities (rm + kill children). An earlier
-# version set `trap 'rm -f "$PID_FILE"' EXIT` here AND `trap cleanup EXIT...`
-# later — the second trap shadowed the first, so the PID file was never
-# removed on clean exit. Stale PID files don't break the `kill -0` gate (it
-# correctly identifies dead PIDs), but they accumulated forever, and the
-# Stop-hook path that relies on this file being current got confused by
-# leftover entries from prior sessions. Dirty exits (SIGKILL, panic) still
-# skip the trap — the Stop hook + startup reaper cover those.
 
 # tmux socket for the wakeup signal. Sutando.app creates the CLI session via
 # this socket. If the socket doesn't exist (different setup), wakeup is a
@@ -710,6 +697,45 @@ fswatch \
   --event Updated \
   "${fswatch_paths[@]}" > "$WATCH_RUNTIME_DIR/events" 2>/dev/null &
 FSWATCH_PID=$!
+# The writer end opens only once a reader exists, so fswatch execs here, not at
+# the launch above; fd 3 stays open so the loop's own open can never be the last reader.
+exec 3< "$WATCH_RUNTIME_DIR/events"
+fswatch_alive=1
+for _ in 1 2 3 4 5; do
+  kill -0 "$FSWATCH_PID" 2>/dev/null || { fswatch_alive=0; break; }
+  sleep 0.1
+done
+# Exit before the sentinel stamp and the standby kill: a watcher that cannot
+# serve the inbox leaves whatever is serving it untouched.
+if [ "$fswatch_alive" -eq 0 ]; then
+  echo "watch-tasks-stream: fswatch failed to start; no sentinel written and no standby touched" >&2
+  exit 1
+fi
+# In place, never write-elsewhere-then-mv: mv preserves mtime, and
+# sentinel_pid_wrote_file reads mtime as "when this watcher stamped".
+echo "$$" > "$PID_FILE"
+# The watcher beat, `state/watchers/<id>.alive` (docs/worker-pool-design.md). It is
+# handed this pid and exits when it dies: SIGKILL and a crash run no cleanup trap.
+# INJECTED, never located: a core helper may run a path it is handed but must not
+# find an optional skill itself (docs/architecture-boundaries.md). Unset = no beat.
+if [ -n "${SUTANDO_WATCHER_BEAT:-}" ] && [ -f "${SUTANDO_WATCHER_BEAT}" ]; then
+  "$SUTANDO_PY_BIN" "$SUTANDO_WATCHER_BEAT" --workspace "$WORKSPACE_DIR" \
+      --kind watcher --id "${SUTANDO_INSTANCE_ID:-core}" --parent-pid "$$" >/dev/null 2>&1 &
+  WATCHER_BEAT_PID=$!
+fi
+# An in-session (internal) watcher arming means the external standby for THIS
+# inbox is redundant: kill it here, in code, rather than relying on an agent
+# instruction to tear it down (belt-and-suspenders with the supervisor's own
+# poll-and-stop). SUTANDO_TMUX_SESSION is already per-instance (core vs each
+# worker gets a distinct value), so "${SESSION}-watcher" on this process's own
+# socket names only the standby for this same inbox, never another instance's.
+# Only now, with fswatch confirmed up and the sentinel stamped: a kill on any
+# earlier failure path left the inbox with no watcher at all.
+if [ "$WATCHER_ROLE" = "session" ]; then
+  __standby_sock="${SUTANDO_TMUX_SOCKET:-/tmp/sutando-tmux.sock}"
+  __standby_session="${SUTANDO_TMUX_SESSION:-sutando-core}-watcher"
+  tmux -S "$__standby_sock" kill-session -t "=$__standby_session" 2>/dev/null || true
+fi
 # -t bounds the read so a stretch with no fswatch event still gets a periodic,
 # core-only CURRENT_HANDLER re-check -- a safety net independent of whatever
 # event shape the platform's fswatch monitor backend turns out to use.

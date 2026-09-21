@@ -765,16 +765,13 @@ watcher_session_exists() {
 # for once tonight (an unscoped pkill collaterally killed other sessions'
 # production watchers). One instance's liveness must never be answered by
 # another instance's process.
+# The session is healthy while its supervisor runs: in standby it has no
+# notifier or watcher child by design, so a sentinel-pid test would read a
+# correctly idle session as dead and replace it on every rerun.
 watcher_process_alive() {
-  local sentinel pid ws
-  ws="$(bash "$REPO/scripts/sutando-config.sh" workspace 2>/dev/null)" || return 1
-  [ -n "$ws" ] || return 1
-  # shellcheck source=../../../watcher_sentinel.sh
-  . "$REPO/src/watcher_sentinel.sh" || return 1
-  sentinel="$(sentinel_path_for "$ws/state")" || return 1
-  [ -f "$sentinel" ] || return 1
-  pid="$(cat "$sentinel" 2>/dev/null)"
-  [ -n "$pid" ] && [ "$pid" -eq "$pid" ] 2>/dev/null && kill -0 "$pid" 2>/dev/null
+  local pane_pid
+  pane_pid="$(tmux -S "$TMUX_SOCKET" list-panes -t "=$WATCHER_SESSION" -F '#{pane_pid}' 2>/dev/null | head -1)"
+  [ -n "$pane_pid" ] && [ "$pane_pid" -eq "$pane_pid" ] 2>/dev/null && kill -0 "$pane_pid" 2>/dev/null
 }
 
 # The live core's own window and pane, read from the pane that runs it: a heal
@@ -812,6 +809,8 @@ ensure_task_notifier() {
     "$NOTIFIER_SCRIPT"
     "$REPO/src/core-input-watch.py"
     "$REPO/src/delivery/task_dispatch.py"
+    "$REPO/src/tasks-dir-resolve.sh"
+    "$REPO/src/watcher_identity.py"
   )
   # No resolution here: the watcher reads <workspace>/state/task-event-handler.json
   # itself and fswatches it for changes, so the launcher forwards only a genuine
@@ -839,6 +838,12 @@ ensure_task_notifier() {
   [ -n "${SUTANDO_TASKS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASKS_DIR=$SUTANDO_TASKS_DIR")
   [ -n "${SUTANDO_RESULTS_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_RESULTS_DIR=$SUTANDO_RESULTS_DIR")
   [ -n "${SUTANDO_WORKSPACE_DIR:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_WORKSPACE_DIR=$SUTANDO_WORKSPACE_DIR")
+  # Standby/grace-period knobs: unset here means the supervisor keeps
+  # its own generic defaults. A skill that needs different pacing for an
+  # instance it spawns sets these in ITS environment before this launcher
+  # runs, same forwarding pattern as every other var above.
+  [ -n "${SUTANDO_NOTIFIER_GRACE_PERIOD:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_GRACE_PERIOD=$SUTANDO_NOTIFIER_GRACE_PERIOD")
+  [ -n "${SUTANDO_NOTIFIER_ROLE_POLL:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_NOTIFIER_ROLE_POLL=$SUTANDO_NOTIFIER_ROLE_POLL")
   # A required Team handler must reach the watcher, or its refusal (rc 4) is never seen.
   [ -n "${SUTANDO_TASK_EVENT_HANDLER:-}" ] && NOTIFIER_ENV_ARGS+=(-e "SUTANDO_TASK_EVENT_HANDLER=$SUTANDO_TASK_EVENT_HANDLER")
   # The exact core window: a heal may land the core off index 0 beside a sibling.
