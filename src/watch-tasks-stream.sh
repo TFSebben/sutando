@@ -282,7 +282,9 @@ task_file_identity() {
   sum="$(cksum < "$1" 2>/dev/null | awk 'NR==1 {print $1 "-" $2}')"
   printf '%s' "${inode}:${sum}"
 }
-HELD_RETRY_INTERVAL="${SUTANDO_HELD_RETRY_INTERVAL:-${SUTANDO_HANDLER_POLL_INTERVAL:-30}}"
+# A held set replays at once on a task or config event; on any other watched
+# event it replays at most this often. No timer exists.
+HELD_RETRY_INTERVAL="${SUTANDO_HELD_RETRY_INTERVAL:-30}"
 # One read per routing decision: the bytes are copied once into a private
 # snapshot and parsed from there; no cache, no compare, nothing to go stale.
 read_handler_config_now() {
@@ -318,8 +320,7 @@ redispatch_held_tasks() {
     [ -n "$fn" ] && [ -f "$TASKS_DIR/$fn" ] && dispatch_task "$TASKS_DIR/$fn"
   done <<< "$held"
 }
-# An elapsed deadline, checked after every event: a busy stream never resets it
-# the way it resets the read timeout.
+# An elapsed deadline, checked after every event; a busy stream never resets it.
 retry_held_tasks_if_due() {
   [ -n "$HELD_NAMES" ] || return 0
   [ "$(date +%s)" -ge "$HELD_RETRY_AT" ] || return 0
