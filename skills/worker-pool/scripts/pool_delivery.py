@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import errno
 import fcntl
 import json
 import os
@@ -221,21 +222,29 @@ def accepted(workspace: Path, recipient: str) -> list[Path]:
                   if (got := parse_sentinel(p.name)) and got[1])
 
 
+def regular_file_state(path) -> str:
+    """"regular", "absent" (ENOENT/ENOTDIR), "non-regular" (a directory, a
+    symlink or a FIFO at the name) or "unknown" (any other OSError: EACCES, EIO).
+    Only the first three are verdicts about the path; "unknown" is about this call.
+    O_NONBLOCK: a FIFO at the name would otherwise block the open with no writer."""
+    try:
+        fd = os.open(str(path), os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+    except (FileNotFoundError, NotADirectoryError):
+        return "absent"
+    except OSError as e:
+        return "non-regular" if e.errno == errno.ELOOP else "unknown"
+    try:
+        return "regular" if stat.S_ISREG(os.fstat(fd).st_mode) else "non-regular"
+    finally:
+        os.close(fd)
+
+
 def is_regular_file(path) -> bool:
     """A REGULAR file at that exact name, never followed. `exists()` accepts a
     directory or a symlink, and authorising delivery on one lets a planted link
-    decide which body the caller reads.
+    decide which body the caller reads. Fail-closed: an unopenable path is False.
     """
-    try:
-        fd = os.open(str(path), os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-    except (FileNotFoundError, NotADirectoryError):
-        return False
-    except OSError:
-        return False  # ELOOP on a symlink: not a delivery, not an error to raise
-    try:
-        return stat.S_ISREG(os.fstat(fd).st_mode)
-    finally:
-        os.close(fd)
+    return regular_file_state(path) == "regular"
 
 
 def find(workspace: Path, recipient: str, task_id: str) -> Path | None:
