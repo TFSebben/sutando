@@ -116,6 +116,72 @@ RESULTS_DIR="${SUTANDO_RESULTS_DIR:-$WORKSPACE_DIR/results}"
 . "$__REPO_ROOT/scripts/python-binary.sh"
 SUTANDO_PY_BIN="$(require_python "$__REPO_ROOT" "watch tasks")" || exit 1
 
+# The duplicate check below is a scan, so two starters at the same instant could
+# each see the other and both exit (zero announcers) or both run. A per-inbox
+# lock dir, held from the scan through the sentinel stamp, serializes them: the
+# second waits and then sees the first's sentinel. mkdir is the atomic primitive
+# (no flock binary on macOS; an flock'd fd would be inherited by fswatch).
+START_LOCK_TIMEOUT_S="${SUTANDO_WATCHER_START_LOCK_TIMEOUT_S:-30}"
+START_LOCK="$WORKSPACE_DIR/state/watch-tasks-stream.start-$(printf '%s' "$TASKS_DIR_ABS" | cksum | cut -d' ' -f1).lock"
+release_start_lock() {
+  [ -n "${START_LOCK:-}" ] || return 0
+  [ "$(cat "$START_LOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$START_LOCK"
+  START_LOCK=""
+}
+mkdir -p "$WORKSPACE_DIR/state" 2>/dev/null || true
+__lock_deadline=$(( $(date +%s) + START_LOCK_TIMEOUT_S ))
+while ! mkdir "$START_LOCK" 2>/dev/null; do
+  __lpid="$(cat "$START_LOCK/pid" 2>/dev/null)"
+  # A lock with no pid file is a winner that died between mkdir and its pid
+  # write; older than a few seconds it is nobody's, so it is reclaimed like a dead pid.
+  __ldead=""
+  if [ -z "$__lpid" ]; then
+    __lmt="$(stat -c %Y -- "$START_LOCK" 2>/dev/null || true)"
+    case "$__lmt" in ''|*[!0-9]*) __lmt="$(stat -f %m -- "$START_LOCK" 2>/dev/null || true)" ;; esac
+    case "$__lmt" in ''|*[!0-9]*) ;; *) [ $(( $(date +%s) - __lmt )) -gt 5 ] && __ldead=1 ;; esac
+  fi
+  case "$__lpid" in
+    ''|*[!0-9]*) ;;
+    *) kill -0 "$__lpid" 2>/dev/null || __ldead=1 ;;
+  esac
+  if [ -n "$__ldead" ]; then
+    # Rename, never rm in place: two starters over one dead lock would both
+    # rm, and the second rm takes the first's fresh lock with it.
+    if mv "$START_LOCK" "$START_LOCK.dead.$$" 2>/dev/null; then
+      # mv moves whatever is at the path: if another taker already replaced
+      # the dead lock with its live one, give that one back untouched. A third
+      # starter creating the lock inside that window nests the returned dir
+      # under its own (today's double run at worst; nothing is deleted).
+      __mpid="$(cat "$START_LOCK.dead.$$/pid" 2>/dev/null)"
+      # A pid-less lock is identified by the MOVED dir's age, never by its empty
+      # pid: a brand-new lock whose winner has not written its pid yet looks the same.
+      __mold=""
+      if [ -z "$__lpid" ] && [ -z "$__mpid" ]; then
+        __mmt="$(stat -c %Y -- "$START_LOCK.dead.$$" 2>/dev/null || true)"
+        case "$__mmt" in ''|*[!0-9]*) __mmt="$(stat -f %m -- "$START_LOCK.dead.$$" 2>/dev/null || true)" ;; esac
+        case "$__mmt" in ''|*[!0-9]*) ;; *) [ $(( $(date +%s) - __mmt )) -gt 5 ] && __mold=1 ;; esac
+      fi
+      if { [ -n "$__lpid" ] && [ "$__mpid" = "$__lpid" ]; } || [ -n "$__mold" ]; then
+        echo "watch-tasks-stream: start lock on $TASKS_DIR_ABS was left by dead pid ${__lpid:-<none>}; taking it over" >&2
+        rm -rf "$START_LOCK.dead.$$"
+      elif ! mv "$START_LOCK.dead.$$" "$START_LOCK" 2>/dev/null; then
+        rm -rf "$START_LOCK.dead.$$"
+      fi
+    fi
+    continue
+  fi
+  if [ "$(date +%s)" -ge "$__lock_deadline" ]; then
+    # Refusing would leave the inbox with no announcer; the scan below still runs.
+    echo "watch-tasks-stream: start lock on $TASKS_DIR_ABS held by pid ${__lpid:-unknown} for ${START_LOCK_TIMEOUT_S}s; starting without it" >&2
+    START_LOCK=""; break
+  fi
+  sleep 0.1
+done
+[ -n "$START_LOCK" ] && echo "$$" > "$START_LOCK/pid"
+# Every exit before the sentinel stamp must give the lock back; the main cleanup
+# trap armed later replaces this one and releases it too.
+trap release_start_lock EXIT
+
 # One announcer per inbox, enforced here rather than by every launcher: a start
 # over a holder exits 0 as covered and says so on stdout, and only
 # --force-restart replaces the holder, whatever its kind. The one exception is a
@@ -864,6 +930,7 @@ cleanup() {
   # cleanup helpers so a subshell cannot recursively re-enter the trap.
   trap - EXIT
   trap '' TERM HUP INT
+  release_start_lock
   # A duplicate watcher can overwrite the sentinel before the stale watcher
   # exits. Only the watcher named by the file may remove it; otherwise the live
   # watcher would look orphaned and recovery would spawn another duplicate.
@@ -1021,6 +1088,8 @@ fi
 # In place, never write-elsewhere-then-mv: mv preserves mtime, and
 # sentinel_pid_wrote_file reads mtime as "when this watcher stamped".
 echo "$$" > "$PID_FILE"
+# The sentinel is what a waiting starter's scan will see: the lock's job is done.
+release_start_lock
 # The watcher beat, `state/watchers/<id>.alive` (docs/worker-pool-design.md). It is
 # handed this pid and exits when it dies: SIGKILL and a crash run no cleanup trap.
 # INJECTED, never located: a core helper may run a path it is handed but must not
