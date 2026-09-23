@@ -12,7 +12,74 @@
 # Resolve through the same helper every other service uses, so a configured
 # workspace (sutando.config.local.json) is honored rather than assumed.
 
+# A foreign-cwd session is a guest, not the core, unless it identifies itself: an
+# enrolled worker (SUTANDO_INSTANCE_ID) or the launcher's marked core (SUTANDO_CORE_SESSION).
 REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+IDENTIFIED_SESSION=""
+if [ -n "${SUTANDO_INSTANCE_ID:-}" ] || [ -n "${SUTANDO_CORE_SESSION:-}" ]; then
+  IDENTIFIED_SESSION=1
+fi
+# A bare `git` can be the macOS CLT stub (REVIEW.md lesson 7) — resolve
+# through the same rules src/git_binary.py uses, not PATH directly.
+. "$REPO_DIR/scripts/git-binary.sh"
+GIT_BIN="$(resolve_git)"
+if [ -n "$GIT_BIN" ]; then
+  # A caller-inherited ceiling, repository override, or locale can each turn
+  # a real, still-ours directory into a false "different repo" or "absent".
+  GIT_PROBE_ENV="env -u GIT_CEILING_DIRECTORIES -u GIT_DIR -u GIT_COMMON_DIR LC_ALL=C LANGUAGE=C"
+  # --path-format=absolute (git >= 2.31): a plain rev-parse, run from a
+  # different cwd, can print a path relative to <dir> instead of to the caller.
+  CWD_COMMON_DIR="$($GIT_PROBE_ENV "$GIT_BIN" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"
+  # Capture git's own stderr instead of discarding it: only git explicitly
+  # saying "not a git repository" may ever license the guest exit below.
+  REPO_COMMON_DIR="$($GIT_PROBE_ENV "$GIT_BIN" -C "$REPO_DIR" rev-parse --path-format=absolute --git-common-dir 2>&1)"
+  REPO_PROBE_RC=$?
+  REPO_PROBE_ERR=""
+  [ "$REPO_PROBE_RC" -ne 0 ] && REPO_PROBE_ERR="$REPO_COMMON_DIR" && REPO_COMMON_DIR=""
+  # A `-C DIR` probe and an actually-`cd`'d one can disagree in ways neither
+  # side's stdout reveals; retry via `cd` before trusting an empty result.
+  if [ -z "$REPO_COMMON_DIR" ]; then
+    FALLBACK_OUT="$(cd "$REPO_DIR" 2>/dev/null && $GIT_PROBE_ENV "$GIT_BIN" rev-parse --path-format=absolute --git-common-dir 2>&1)"
+    if [ $? -eq 0 ]; then
+      REPO_COMMON_DIR="$FALLBACK_OUT"
+      REPO_PROBE_ERR=""
+    else
+      [ -n "$FALLBACK_OUT" ] && REPO_PROBE_ERR="$FALLBACK_OUT"
+    fi
+  fi
+  # Kept PRE-canonicalization -- a path that then fails to `cd` must not
+  # read the same as no identity ever being found (see the elif below).
+  REPO_COMMON_DIR_RAW="$REPO_COMMON_DIR"
+  # Canonicalize past any symlink in the path itself (e.g. macOS /tmp -> /private/tmp) —
+  # --path-format=absolute fixes relative-vs-cwd, not a same-directory answer spelled two ways.
+  [ -n "$CWD_COMMON_DIR" ] && CWD_COMMON_DIR="$(cd "$CWD_COMMON_DIR" 2>/dev/null && pwd -P)"
+  [ -n "$REPO_COMMON_DIR" ] && REPO_COMMON_DIR="$(cd "$REPO_COMMON_DIR" 2>/dev/null && pwd -P)"
+  # A known identity wins regardless of the marker; marker absence (incl. `-L`,
+  # so a dangling symlink still counts as present) only breaks the empty-probe tie.
+  case "$REPO_PROBE_ERR" in
+    *"not a git repository"*) REPO_CONFIRMED_ABSENT=1 ;;
+    *) REPO_CONFIRMED_ABSENT="" ;;
+  esac
+  if [ -n "$REPO_COMMON_DIR" ]; then
+    if [ -n "$CWD_COMMON_DIR" ] && [ "$CWD_COMMON_DIR" != "$REPO_COMMON_DIR" ] \
+       && [ -z "$IDENTIFIED_SESSION" ]; then
+      echo '{}'
+      exit 0
+    fi
+  elif [ -n "$REPO_COMMON_DIR_RAW" ]; then
+    : # a real answer that then failed to canonicalize -- ambiguous, fall through to gate
+  elif [ -e "$REPO_DIR/.git" ] || [ -L "$REPO_DIR/.git" ]; then
+    : # marker present, probe still failed -- ambiguous, fall through to gate
+  elif [ -n "$CWD_COMMON_DIR" ] && [ -n "$REPO_CONFIRMED_ABSENT" ] \
+       && [ -z "$IDENTIFIED_SESSION" ]; then
+    # Both probes failed AND git itself confirmed no repo -- not just an
+    # unresolved probe on a markerless child that IS still ours.
+    echo '{}'
+    exit 0
+  fi
+fi
+# No runnable git -- cannot prove a DIFFERENT repo, so proceed as core rather
+# than raising a CLT dialog or silently skipping every guest.
 WORKSPACE="$(bash "$REPO_DIR/scripts/sutando-config.sh" workspace 2>/dev/null)"
 # Fall back to the documented default, never to the repo root: a resolver
 # failure must still leave this pointed at a real queue rather than silently
@@ -56,6 +123,9 @@ claimed_by_a_worker() {
   # shared with the task notifiers; no python reads as "not held" (reported, like already_delivered).
   local task_id="$1" rc
   [ -n "$PYBIN" ] || return 1
+  # A missing script (minimal bundle) can hold nothing -- its rc 2 must not
+  # collapse into the same code path as "deliveries root unreadable" below.
+  [ -f "$REPO_DIR/src/delivery/task_dispatch.py" ] || return 1
   "$PYBIN" "$REPO_DIR/src/delivery/task_dispatch.py" worker-holds "$DELIVERIES_DIR" "$task_id.txt" >/dev/null 2>&1; rc=$?
   # 2 = cannot decide (root unreadable): hold, never report it to the core.
   [ "$rc" -eq 0 ] || [ "$rc" -eq 2 ]
@@ -99,6 +169,17 @@ if [ -n "${SUTANDO_INSTANCE_ID:-}" ]; then
   for TASK_ID in $OWNED; do
     already_delivered "$TASK_ID" && continue
     if [ -f "$RESULTS_DIR/$TASK_ID.txt" ]; then
+      # Readiness is owned by src/delivery/readiness.py; existence is not
+      # readiness, so with no interpreter to ask, this stays UNPROCESSED.
+      if [ -z "$PYBIN" ]; then
+        UNPROCESSED+="--- $TASK_ID.txt (readiness unknown — no interpreter to check) ---
+
+"
+        continue
+      fi
+      if SUTANDO_SRC="$REPO_DIR/src" SUTANDO_RESULT="$RESULTS_DIR/$TASK_ID.txt" "$PYBIN" -c 'import os,sys; sys.path.insert(0, os.environ["SUTANDO_SRC"]); from delivery.readiness import read_ready_result; sys.exit(0 if read_ready_result(os.environ["SUTANDO_RESULT"]) is not None else 1)'; then
+        continue
+      fi
       UNPROCESSED+="--- $TASK_ID.txt (result file is EMPTY — it delivers nothing; write a real reply) ---
 
 "
@@ -119,6 +200,17 @@ else
     claimed_by_a_worker "$TASK_ID" && continue
     already_delivered "$TASK_ID" && continue
     if [ -f "$RESULTS_DIR/$BASENAME" ]; then
+      # Readiness is owned by src/delivery/readiness.py; existence is not
+      # readiness, so with no interpreter to ask, this stays UNPROCESSED.
+      if [ -z "$PYBIN" ]; then
+        UNPROCESSED+="--- $BASENAME (readiness unknown — no interpreter to check) ---
+
+"
+        continue
+      fi
+      if SUTANDO_SRC="$REPO_DIR/src" SUTANDO_RESULT="$RESULTS_DIR/$BASENAME" "$PYBIN" -c 'import os,sys; sys.path.insert(0, os.environ["SUTANDO_SRC"]); from delivery.readiness import read_ready_result; sys.exit(0 if read_ready_result(os.environ["SUTANDO_RESULT"]) is not None else 1)'; then
+        continue
+      fi
       UNPROCESSED+="--- $BASENAME (result file is EMPTY — it delivers nothing; write a real reply) ---
 
 "
@@ -157,6 +249,13 @@ fi
 # Claude Code sets on every subprocess it spawns, hooks included — see
 # turn_ledger.py's SESSION SCOPING note. Absent that env var (a non-Claude-Code
 # context), behavior is exactly the original shared-file default.
+
+# An empty PYBIN must never reach "$PYBIN" as a command -- fail open explicitly
+# rather than lean on an empty command's exit code happening not to equal 1.
+if [ -z "$PYBIN" ]; then
+  echo '{}'
+  exit 0
+fi
 STOP_REASON="$("$PYBIN" "$REPO_DIR/src/turn_ledger.py" --workspace "$WORKSPACE" stop-gate 2>/dev/null)"
 STOP_RC=$?
 
