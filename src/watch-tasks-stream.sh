@@ -250,6 +250,15 @@ if [ -z "${SUTANDO_INSTANCE_ID:-}" ]; then
     exit 1
   }
   HANDLER_CONFIG_DIR="$(dirname "$HANDLER_CONFIG_PATH")"
+  # fswatch names this directory by its physical path; handle_event compares to it.
+  if [ -n "$HANDLER_CONFIG_PATH" ]; then
+    mkdir -p "$HANDLER_CONFIG_DIR"
+    HANDLER_CONFIG_DIR="$(canonical_tasks_dir "$HANDLER_CONFIG_DIR")" || {
+      echo "watch-tasks-stream: could not canonicalize the task-event-handler config dir" >&2
+      exit 1
+    }
+    HANDLER_CONFIG_PATH="$HANDLER_CONFIG_DIR/${HANDLER_CONFIG_PATH##*/}"
+  fi
 fi
 
 # absent: no config on disk (the core takes every task). ready: parsed. broken: a
@@ -1024,28 +1033,9 @@ if [ "$WATCHER_ROLE" = "session" ]; then
   done <<< "$PRE_READY_EVENTS"
   startup_sweep
 fi
-# -t bounds the read so a stretch with no fswatch event still gets a periodic,
-# core-only CURRENT_HANDLER re-check -- a safety net independent of whatever
-# event shape the platform's fswatch monitor backend turns out to use.
-while true; do
-  IFS= read -r -t "${SUTANDO_HANDLER_POLL_INTERVAL:-30}" path <&3
-  read_rc=$?
-  if [ "$read_rc" -ne 0 ]; then
-    # macOS's /bin/bash (3.2) returns 1 for both a read TIMEOUT and EOF, so the
-    # exit code alone can't distinguish them -- ask whether fswatch is still
-    # alive (same pattern as src/agent/codex/cli/task-notifier.sh).
-    if kill -0 "$FSWATCH_PID" 2>/dev/null; then
-      if [ -n "$HANDLER_CONFIG_PATH" ]; then
-        reload_current_handler
-        [ -n "$CURRENT_HANDLER" ] && [ -x "$CURRENT_HANDLER" ] && prepare_handler_state
-        redispatch_held_tasks
-      fi
-      continue
-    fi
-    # fswatch died and closed its end of the pipe: genuine EOF. Fall through
-    # to the script's normal exit path rather than spinning on a dead FIFO.
-    break
-  fi
+# EOF (fswatch died) ends the loop on the normal exit path; fd 3 is shared with the
+# readiness replay above, since a second open of the FIFO would race it for bytes.
+while IFS= read -r path <&3; do
   handle_event "$path"
   retry_held_tasks_if_due
 done
