@@ -79,6 +79,15 @@ def classify(workspace, task: dict) -> tuple[int, list, dict | None]:
     # the older one stamps source itself. Either mark means the same command.
     if PICKER_WIRE in (task.get("wire_source"), task.get("source")):
         return DECLINE, [], None
+    # A replay follows the delivery already committed to a worker, whatever the
+    # bindings say now; the roster still decides for a task nobody holds yet.
+    try:
+        committed = rt.committed_recipient(workspace, task.get("id") or "")
+    except rt.RouterRefused as e:      # a conflict, or evidence that cannot be read
+        print(f"pool_route_handler: {e}", file=sys.stderr)
+        return MUST_HANDLE, [], None
+    if committed is not None and committed != pr.CORE:
+        return 0, [committed], None
     try:
         raw = pr._load_existing_roster_strict(workspace)
     except pr.RosterError:
@@ -182,7 +191,10 @@ def main(argv=None) -> int:
         print(f"pool_route_handler: delivery failed: {e}", file=sys.stderr)
         return MUST_HANDLE
     settled = set(out.get("delivered") or []) | set(out.get("already") or [])
-    unsettled = [t for t in targets if t not in settled] + list(out.get("skipped") or [])
+    # Judge settlement by the targets the route COMMITTED to, not the probe's
+    # snapshot: a commit that landed between the two is not a missing delivery.
+    routed = list(out.get("targets") or targets)
+    unsettled = [t for t in routed if t not in settled] + list(out.get("skipped") or [])
     if unsettled:
         # 0 here releases the watcher's claim on a task no worker holds.
         print(json.dumps({**out, "unsettled": unsettled}), file=sys.stderr)
