@@ -12438,6 +12438,48 @@ def proxy_liveness_status(proxy_check: dict) -> str:
     return proxy_check.get("status")
 
 
+def _credential_proxy_wedge_from_quota_state(check: dict) -> None:
+    """Escalate `check` to 'warn' when the proxy's own last-recorded credential
+    state (quota-state.json, written by recordCredentialState()) is 'exhausted'
+    and was recorded by the current process (a record older than the process
+    start is ignored). Advisory: silent on any read/parse failure, and never
+    runs unless the caller's own gate already proved the port is 'ok'/'stale'.
+    """
+    if check["status"] not in ("ok", "stale"):
+        return
+    path = status_read_path("quota-state.json", WORKSPACE_DIR)
+    if not path.exists():
+        return
+    try:
+        state = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return
+    if not isinstance(state, dict) or state.get("credential_state") != "exhausted":
+        return
+    detail = state.get("credential_state_detail") or "no detail recorded"
+    at = state.get("credential_state_at")
+    age = ""
+    at_ts = None
+    if isinstance(at, str):
+        from datetime import datetime as _dt  # local: not at module scope in this file
+        try:
+            at_ts = _dt.fromisoformat(at.replace("Z", "+00:00")).timestamp()
+            age_s = time.time() - at_ts
+            age = f" ({int(age_s / 60)}m ago)" if age_s >= 0 else ""
+        except ValueError:
+            pass
+    # Written only on a transition, never reset at startup: a restart inherits
+    # a stale 'exhausted' record, which predates the process that would prove it.
+    starts, _ = _proc_lstarts("credential-proxy")
+    if at_ts is not None and starts and at_ts < max(starts):
+        return
+    check["status"] = "warn"
+    check["detail"] = (
+        f"listening, but its own last-recorded credential state is 'exhausted'{age}: "
+        f"{detail} — requests are likely 401ing/502ing despite the port being open"
+    )
+
+
 def check_credential_proxy() -> dict:
     """Credential proxy (port 7846). probe=False: a forwarding proxy has no
     liveness endpoint, so an HTTP probe is forwarded and misread as wedged."""
@@ -12458,6 +12500,7 @@ def check_credential_proxy() -> dict:
                          if _process_executes_artifact(artifact, "credential-proxy")
                          else None),
         )
+        _credential_proxy_wedge_from_quota_state(check)
     # Pin verdicts resolve on EVERY branch: a healthy replacement or a down
     # service still owes any ORPHAN/MISMATCH/EXPIRED finding to the report.
     _, _pls = _proc_lstarts("credential-proxy")
