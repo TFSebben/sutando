@@ -303,8 +303,55 @@ const DEFAULT_TASK_TIMEOUT_MS = 60 * 60 * 1000; // 1 hour default
 // emit a Discord DM to the owner if this task hits its timeout. dm_on_timeout
 // defaults to false (silent timeout — Susan's PR #578 contract). Voice agent
 // can flip it true on critical tasks to get a fallback notification.
-type PendingTask = { submittedAt: number; timeoutMs: number; dmOnTimeout: boolean; taskText: string };
+// `startedAt` is when the bridge first SAW the core pick the task up (the
+// activity snapshot left QUEUED); the per-task timeout counts from there, not
+// from submission (user feedback P1-4: a 10-minute task timed out in the queue
+// behind other work, the agent said it "ran out of time", and the task file
+// was archived out from under the core).
+type PendingTask = { submittedAt: number; timeoutMs: number; dmOnTimeout: boolean; taskText: string; startedAt?: number };
 const _pendingTasks = new Map<string, PendingTask>();
+/** Test-only: the pending map, to seed and inspect around _sweepTimeouts. */
+export const _pendingTasksForTest = _pendingTasks;
+
+// The scheduler's durable per-task lifecycle (src/activity_bus.py). The watcher
+// marks RUNNING at announce (task-emit.sh), which is delivery, not work: the core
+// may still be on the previous task. "Started" therefore means ENGAGED, the same
+// rule the Stop hook uses (#4863): a runtime event applied to the snapshot
+// (seq > 0) or a `working` row from the session's own activity hook naming the
+// task. A snapshot without engagement is still queued; no snapshot at all (a
+// runtime that never writes one) keeps the submission clock.
+export type TaskActivity = 'started' | 'queued' | 'none';
+const ENGAGED_ROW_KINDS = new Set(['working']);
+
+/** Whether the session's own activity hook recorded real work on the task. */
+export function _taskHasWorkingRow(taskId: string): boolean {
+	const log = join(REPO_DIR, 'state', 'agent-activity.jsonl');
+	if (!existsSync(log)) return false;
+	try {
+		for (const line of readFileSync(log, 'utf-8').split('\n')) {
+			if (!line.includes(taskId)) continue;
+			let rec: { projection?: unknown; kind?: unknown; task?: { id?: unknown } };
+			try { rec = JSON.parse(line); } catch { continue; }
+			if (!rec || rec.projection === 'TASK_STATUS' || rec.task?.id !== taskId) continue;
+			if (typeof rec.kind === 'string' && ENGAGED_ROW_KINDS.has(rec.kind)) return true;
+		}
+	} catch { /* unreadable log: no evidence */ }
+	return false;
+}
+
+export function _taskActivity(taskId: string): TaskActivity {
+	const snap = join(REPO_DIR, 'state', 'activity', `${taskId}.json`);
+	if (!existsSync(snap)) return 'none';
+	try {
+		const d = JSON.parse(readFileSync(snap, 'utf-8')) as { phase?: unknown; seq?: unknown };
+		if (typeof d.phase !== 'string') return 'none';
+		if (['COMPLETED', 'FAILED', 'CANCELLED'].includes(d.phase)) return 'started';
+		const eventApplied = typeof d.seq === 'number' && d.seq > 0;
+		return eventApplied || _taskHasWorkingRow(taskId) ? 'started' : 'queued';
+	} catch {
+		return 'none';
+	}
+}
 
 // Dedup window: identical task text within 2 minutes → return existing taskId.
 const DEDUP_WINDOW_MS = 2 * 60 * 1000;
@@ -1105,6 +1152,103 @@ function startRelayResultWatcher(onResult: ResultListener): void {
 	}, 2000);
 }
 
+
+/** The task's own `task:` line, bounded to 80 chars for voice narration; '' if unreadable. */
+function _taskSnippet(taskId: string): string {
+	const taskFile = join(TASK_DIR, `${taskId}.txt`);
+	if (!existsSync(taskFile)) return '';
+	try {
+		const body = readFileSync(taskFile, 'utf-8');
+		const taskLine = body.split('\n').find(l => l.startsWith('task:'));
+		const raw = (taskLine ? taskLine.slice(5) : '').trim();
+		return raw.length > 80 ? raw.slice(0, 77) + '...' : raw;
+	} catch {
+		return '';
+	}
+}
+
+/** The result watcher's timeout pass, once per tick. A task's timeout counts
+ *  from the moment the core picked it up (the activity snapshot left QUEUED),
+ *  never from submission; a task still queued past the queue bound is reported
+ *  as unpicked and left in tasks/. Exported for unit testing. */
+export function _sweepTimeouts(onResult: (msg: string) => void, now: number = Date.now()): void {
+	for (const [taskId, pending] of _pendingTasks) {
+		const { submittedAt, timeoutMs, dmOnTimeout } = pending;
+		// timeoutMs === 0 means "no timeout" — skip the check entirely.
+		if (timeoutMs === 0) continue;
+		const activity = pending.startedAt === undefined ? _taskActivity(taskId) : 'started';
+		if (pending.startedAt === undefined && activity === 'started') pending.startedAt = now;
+		// No snapshot at all: a runtime that never writes one. The pickup is
+		// invisible, so the clock runs from submission as it always did.
+		const clockStart = pending.startedAt ?? (activity === 'none' ? submittedAt : undefined);
+		if (clockStart === undefined) {
+			// Still queued: its own timeout has not begun. A task nobody picks up
+			// within the queue bound is reported as unpicked and LEFT in tasks/,
+			// so a restarted engine still finds it.
+			if (now - submittedAt > Math.max(timeoutMs, DEFAULT_TASK_TIMEOUT_MS)) {
+				_pendingTasks.delete(taskId);
+				const waited = Math.floor((now - submittedAt) / 60000);
+				const snippet = _taskSnippet(taskId);
+				console.error(`${ts()} [TaskBridge] Task ${taskId} (${snippet || '?'}) was never picked up after ${waited}m; left in tasks/`);
+				_sendTaskStatus?.(taskId, 'timeout', snippet
+					? `Task '${snippet}' has not been picked up after ${waited} minutes — the processing engine may be down`
+					: `Task has not been picked up after ${waited} minutes — the processing engine may be down`);
+				onResult(snippet
+					? `[Task ${taskId} ('${snippet}') has not been picked up after ${waited} minutes. It is still queued; the processing engine may need to be restarted.]`
+					: `[Task ${taskId} has not been picked up after ${waited} minutes. It is still queued; the processing engine may need to be restarted.]`);
+			}
+			continue;
+		}
+		if (now - clockStart > timeoutMs) {
+			_pendingTasks.delete(taskId);
+			// Read the task body (or a snippet of it) so the timeout message
+			// can identify which task timed out — the prior generic "[Task
+			// timed out]" string left no clue when multiple tasks were in
+			// flight. Snippet is bounded to 80 chars to keep the voice
+			// narration short.
+			const taskFile = join(TASK_DIR, `${taskId}.txt`);
+			const taskSnippet = _taskSnippet(taskId);
+			console.error(`${ts()} [TaskBridge] Task ${taskId} (${taskSnippet || '?'}) timed out after ${timeoutMs / 1000}s`);
+			const statusMsg = taskSnippet
+				? `Task '${taskSnippet}' timed out — core agent may be unresponsive`
+				: 'Task timed out — core agent may be unresponsive';
+			_sendTaskStatus?.(taskId, 'timeout', statusMsg);
+			const minutes = Math.floor(timeoutMs / 60000);
+			const userMsg = taskSnippet
+				? `[Task ${taskId} ('${taskSnippet}') timed out after ${minutes} minutes. The processing engine may need to be restarted.]`
+				: `[Task ${taskId} timed out after ${minutes} minutes. The processing engine may need to be restarted.]`;
+			onResult(userMsg);
+			// Move the task file out of tasks/ so /tasks/active stops listing it
+			// as 'working' forever. (Without this, dedup-orphan tasks left behind
+			// after a consolidated reply pile up in the UI as stuck spinners.)
+			// Use archiveFile() — same destination (tasks/archive/<YYYY-MM>/) as
+			// the result-delivery archival paths so all timeout/done/dedupe lands
+			// in one place. (Mini's #589 review flagged the previous
+			// tasks/processed/ split as a learn-collector scan footprint.)
+			if (existsSync(taskFile)) {
+				archiveFile(taskFile, 'tasks', taskId);
+			}
+			// Discord DM fallback (opt-in via dm_on_timeout). Default off per
+			// Susan's PR #578 contract — silent timeout. We emit by writing
+			// a proactive-*.txt file; discord-bridge.py poll_proactive sends
+			// it to the owner's DM.
+			if (dmOnTimeout) {
+				try {
+					const proactiveTs = Math.floor(Date.now() / 1000);
+					const proactivePath = join(RESULT_DIR, `proactive-timeout-${taskId}-${proactiveTs}.txt`);
+					const dmBody = taskSnippet
+						? `⏱ Task '${taskSnippet}' timed out after ${minutes}m. The processing engine may need to be restarted, or the task may need a longer timeout via timeout_minutes.`
+						: `⏱ Task ${taskId} timed out after ${minutes}m.`;
+					writeFileSync(proactivePath, dmBody);
+					console.log(`${ts()} [TaskBridge] Wrote DM-on-timeout proactive file for ${taskId}`);
+				} catch (e) {
+					console.error(`${ts()} [TaskBridge] Failed to emit DM-on-timeout for ${taskId}:`, e);
+				}
+			}
+		}
+	}
+}
+
 /** The drain's listener: the result text, plus an optional delivery note injected under it
  *  when the written copy went somewhere other than the session was told to expect. */
 export type ResultListener = (result: string, deliveryNote?: string) => void;
@@ -1137,67 +1281,7 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 		// event loop, so the only differential was an early throw in
 		// this body that propagated past the setInterval callback.
 		try {
-		// Check for timed-out tasks — runs every interval regardless of result files
-		for (const [taskId, pending] of _pendingTasks) {
-			const { submittedAt, timeoutMs, dmOnTimeout } = pending;
-			// timeoutMs === 0 means "no timeout" — skip the check entirely.
-			if (timeoutMs === 0) continue;
-			if (Date.now() - submittedAt > timeoutMs) {
-				_pendingTasks.delete(taskId);
-				// Read the task body (or a snippet of it) so the timeout message
-				// can identify which task timed out — the prior generic "[Task
-				// timed out]" string left no clue when multiple tasks were in
-				// flight. Snippet is bounded to 80 chars to keep the voice
-				// narration short.
-				const taskFile = join(TASK_DIR, `${taskId}.txt`);
-				let taskSnippet = '';
-				if (existsSync(taskFile)) {
-					try {
-						const body = readFileSync(taskFile, 'utf-8');
-						const taskLine = body.split('\n').find(l => l.startsWith('task:'));
-						const raw = (taskLine ? taskLine.slice(5) : '').trim();
-						taskSnippet = raw.length > 80 ? raw.slice(0, 77) + '...' : raw;
-					} catch {}
-				}
-				console.error(`${ts()} [TaskBridge] Task ${taskId} (${taskSnippet || '?'}) timed out after ${timeoutMs / 1000}s`);
-				const statusMsg = taskSnippet
-					? `Task '${taskSnippet}' timed out — core agent may be unresponsive`
-					: 'Task timed out — core agent may be unresponsive';
-				_sendTaskStatus?.(taskId, 'timeout', statusMsg);
-				const minutes = Math.floor(timeoutMs / 60000);
-				const userMsg = taskSnippet
-					? `[Task ${taskId} ('${taskSnippet}') timed out after ${minutes} minutes. The processing engine may need to be restarted.]`
-					: `[Task ${taskId} timed out after ${minutes} minutes. The processing engine may need to be restarted.]`;
-				onResult(userMsg);
-				// Move the task file out of tasks/ so /tasks/active stops listing it
-				// as 'working' forever. (Without this, dedup-orphan tasks left behind
-				// after a consolidated reply pile up in the UI as stuck spinners.)
-				// Use archiveFile() — same destination (tasks/archive/<YYYY-MM>/) as
-				// the result-delivery archival paths so all timeout/done/dedupe lands
-				// in one place. (Mini's #589 review flagged the previous
-				// tasks/processed/ split as a learn-collector scan footprint.)
-				if (existsSync(taskFile)) {
-					archiveFile(taskFile, 'tasks', taskId);
-				}
-				// Discord DM fallback (opt-in via dm_on_timeout). Default off per
-				// Susan's PR #578 contract — silent timeout. We emit by writing
-				// a proactive-*.txt file; discord-bridge.py poll_proactive sends
-				// it to the owner's DM.
-				if (dmOnTimeout) {
-					try {
-						const proactiveTs = Math.floor(Date.now() / 1000);
-						const proactivePath = join(RESULT_DIR, `proactive-timeout-${taskId}-${proactiveTs}.txt`);
-						const dmBody = taskSnippet
-							? `⏱ Task '${taskSnippet}' timed out after ${minutes}m. The processing engine may need to be restarted, or the task may need a longer timeout via timeout_minutes.`
-							: `⏱ Task ${taskId} timed out after ${minutes}m.`;
-						writeFileSync(proactivePath, dmBody);
-						console.log(`${ts()} [TaskBridge] Wrote DM-on-timeout proactive file for ${taskId}`);
-					} catch (e) {
-						console.error(`${ts()} [TaskBridge] Failed to emit DM-on-timeout for ${taskId}:`, e);
-					}
-				}
-			}
-		}
+			_sweepTimeouts(onResult);
 		} catch (err) {
 			console.error(`${ts()} [TaskBridge] timeout-check loop threw (non-fatal, continuing watch):`, err);
 		}
