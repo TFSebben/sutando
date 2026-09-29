@@ -14,10 +14,13 @@ Lookup order (read_cloud_auth):
      there, under a key bound to the origin it was minted against
      (cloud_session.rs origin_key_suffix — mirrored byte-for-byte below).
      Under the desktop host (SUTANDO_APP_SUPPORT in the core's environment, or
-     SUTANDO_PACKAGED=1 on the sidecar) the Keychain is probed FIRST:
-     it is the session the app is signed into, and a leftover cloud-auth.json
-     from another workspace or the Electron era made the engine act as a
-     different account than the one the app showed (user feedback P1-11).
+     SUTANDO_PACKAGED=1 on the sidecar) the Keychain is the ONLY record
+     consulted: it is the session the app is signed into, the host writes no
+     file, and a leftover cloud-auth.json from another workspace or the
+     Electron era can hold nothing but a stale bearer, which made the engine
+     act as a different account than the app showed, and keep acting as it
+     after a sign-out (user feedback P1-11). Signed out in the Keychain means
+     signed out; only the metering env (3) is still honoured there.
   3. The metering env the supervisor injects for signed-in runs.
 
 cloud_request() is the one HTTP path: https only, host allowlisted, bearer
@@ -98,14 +101,22 @@ def keychain_get(key: str) -> str | None:
         return None
 
 
-def read_keychain_auth(get: Callable[[str], str | None] = keychain_get):
+def read_keychain_auth(get: Callable[[str], str | None] | None = None, *,
+                       signed_out_is_terminal: bool = False):
     """(apiBase, token) from the Tauri host's origin-scoped Keychain session.
 
     No cross-origin fallback except the host's own retired-production
     carry-over, mirrored here. `get` is injectable so callers that wrap this
-    (report-feedback) keep their own patch points.
+    (report-feedback) keep their own patch points. With
+    `signed_out_is_terminal` (the desktop host), the host's sign-out marker on
+    the current origin ends the lookup: the retired-origin carry-over and the
+    bare pre-scoping key are older sessions, which is exactly what a sign-out
+    must not fall back to.
     """
+    get = get or keychain_get  # resolved at call time, so a patched reader is honoured
     origin = resolve_cloud_origin()
+    if signed_out_is_terminal and get(origin_vault_key(origin)) == SIGNED_OUT_SENTINEL:
+        return None, None
     candidates = [origin]
     if origin == DEFAULT_CLOUD_ORIGIN:
         candidates.extend(RETIRED_CLOUD_ORIGINS)
@@ -141,12 +152,17 @@ def read_cloud_auth(ws: Path, keychain_auth: Callable[[], tuple] | None = None):
     desktop writes no auth file at all — its session lives in the Keychain,
     probed next. Falls back to the metering env the supervisor injects.
     """
-    read_keychain = keychain_auth or read_keychain_auth
-    # The desktop host owns the session: its Keychain outranks any file.
+    # The desktop host owns the session: its Keychain is the only source there
+    # (a file can hold nothing but a stale bearer, wrong again after a sign-out).
     if keychain_first():
-        base, tok = read_keychain()
+        if keychain_auth is not None:
+            base, tok = keychain_auth()
+        else:
+            base, tok = read_keychain_auth(signed_out_is_terminal=True)
         if tok:
             return base, tok
+        return _metering_env_auth()
+    read_keychain = keychain_auth or read_keychain_auth
 
     seen: set[str] = set()
     _app_ws = Path.home() / ".sutando" / "repo" / "workspace"
@@ -169,11 +185,15 @@ def read_cloud_auth(ws: Path, keychain_auth: Callable[[], tuple] | None = None):
         except Exception:
             continue
 
-    if not keychain_first():
-        base, tok = read_keychain()
-        if tok:
-            return base, tok
+    base, tok = read_keychain()
+    if tok:
+        return base, tok
+    return _metering_env_auth()
 
+
+def _metering_env_auth():
+    """(apiBase, token) from the metering env the supervisor injects for a signed-in
+    run, else (None, None)."""
     hdrs = os.environ.get("SUTANDO_METERING_HEADERS")
     if hdrs:
         try:

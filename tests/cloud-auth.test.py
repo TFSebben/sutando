@@ -114,17 +114,70 @@ class TestReadCloudAuthOrder(unittest.TestCase):
             ws = self._ws(tmp)
             keychain = lambda: ("https://sutando.ag2.space", "sutk_keychain")  # noqa: E731
             self.assertEqual(cloud_auth.read_cloud_auth(ws, keychain_auth=keychain)[1], "sutk_keychain")
-            # No Keychain session: the file still serves, and it is not probed twice.
+            # Signed out in the Keychain (no session, or the sign-out sentinel): the
+            # leftover file is not consulted; under the host it is only ever stale.
             calls = []
             def none():
                 calls.append(1)
                 return (None, None)
-            self.assertEqual(cloud_auth.read_cloud_auth(ws, keychain_auth=none)[1], "sutk_file")
-            self.assertEqual(len(calls), 1)
-            # Signed out everywhere: nothing.
-            (ws / "state" / "auth" / "cloud-auth.json").unlink()
             cloud_auth.os.environ.pop("SUTANDO_METERING_HEADERS", None)
             self.assertEqual(cloud_auth.read_cloud_auth(ws, keychain_auth=none), (None, None))
+            self.assertEqual(len(calls), 1)
+            signed_out = lambda: cloud_auth.read_keychain_auth(get=lambda k: cloud_auth.SIGNED_OUT_SENTINEL)  # noqa: E731
+            self.assertEqual(cloud_auth.read_cloud_auth(ws, keychain_auth=signed_out), (None, None))
+            self.assertTrue((ws / "state" / "auth" / "cloud-auth.json").exists(), "the file is left alone, just not read")
+            # The supervisor's metering env for a signed-in run is still honoured under the host.
+            with mock.patch.dict(cloud_auth.os.environ, {
+                "SUTANDO_METERING_HEADERS": json.dumps({"Authorization": "Bearer sutk_metering"}),
+                "SUTANDO_METERING_ENDPOINT": "https://sutando.ag2.space/api/usage/v2"}):
+                self.assertEqual(cloud_auth.read_cloud_auth(ws, keychain_auth=none),
+                                 ("https://sutando.ag2.space", "sutk_metering"))
+
+
+class TestSignedOutIsTerminalUnderTheHost(unittest.TestCase):
+    """Review of #4871 (Rui): a sign-out marker on the current origin must end the
+    lookup under the desktop host; the retired-origin carry-over and the bare
+    pre-scoping key are older sessions."""
+
+    def _store(self, **extra):
+        cur = cloud_auth.origin_vault_key(cloud_auth.DEFAULT_CLOUD_ORIGIN)
+        store = {cur: cloud_auth.SIGNED_OUT_SENTINEL, **extra}
+        return store.get
+
+    def test_the_retired_origin_key_does_not_serve_after_sign_out(self):
+        retired = cloud_auth.origin_vault_key(cloud_auth.RETIRED_CLOUD_ORIGINS[0])
+        get = self._store(**{retired: "sutk_OLD_retired"})
+        with mock.patch.dict(cloud_auth.os.environ, {}, clear=False):
+            cloud_auth.os.environ.pop("AG2_CLOUD_ORIGIN", None)
+            self.assertEqual(cloud_auth.read_keychain_auth(get=get, signed_out_is_terminal=True), (None, None))
+            # Outside the host the carry-over is still honoured (unchanged behaviour).
+            self.assertEqual(cloud_auth.read_keychain_auth(get=get)[1], "sutk_OLD_retired")
+
+    def test_the_bare_token_does_not_serve_after_sign_out(self):
+        get = self._store(AG2_CLOUD_TOKEN="sutk_OLD_bare")
+        with mock.patch.dict(cloud_auth.os.environ, {}, clear=False):
+            cloud_auth.os.environ.pop("AG2_CLOUD_ORIGIN", None)
+            self.assertEqual(cloud_auth.read_keychain_auth(get=get, signed_out_is_terminal=True), (None, None))
+            self.assertEqual(cloud_auth.read_keychain_auth(get=get)[1], "sutk_OLD_bare")
+
+    def test_read_cloud_auth_under_the_host_is_terminal_too(self):
+        import tempfile
+        retired = cloud_auth.origin_vault_key(cloud_auth.RETIRED_CLOUD_ORIGINS[0])
+        store = {cloud_auth.origin_vault_key(cloud_auth.DEFAULT_CLOUD_ORIGIN): cloud_auth.SIGNED_OUT_SENTINEL,
+                 retired: "sutk_OLD_retired", "AG2_CLOUD_TOKEN": "sutk_OLD_bare"}
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(cloud_auth.os.environ, {"SUTANDO_PACKAGED": "1"}), \
+                mock.patch.object(cloud_auth.Path, "home", return_value=Path(tmp) / "home"), \
+                mock.patch.object(cloud_auth, "keychain_get", store.get):
+            cloud_auth.os.environ.pop("AG2_CLOUD_ORIGIN", None)
+            cloud_auth.os.environ.pop("SUTANDO_METERING_HEADERS", None)
+            ws = Path(tmp) / "ws"
+            (ws / "state" / "auth").mkdir(parents=True)
+            (ws / "state" / "auth" / "cloud-auth.json").write_text(json.dumps({"token": "sutk_file"}))
+            self.assertEqual(cloud_auth.read_cloud_auth(ws), (None, None))
+            # A live session on the current origin still serves.
+            store[cloud_auth.origin_vault_key(cloud_auth.DEFAULT_CLOUD_ORIGIN)] = "sutk_live"
+            self.assertEqual(cloud_auth.read_cloud_auth(ws)[1], "sutk_live")
 
 
 class TestCloudRequest(unittest.TestCase):
