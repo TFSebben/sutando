@@ -10446,6 +10446,69 @@ def check_claude_task_notifier() -> dict:
     return _probe_task_notifier(target, name=name, expected=supervisor, script=notifier)
 
 
+def _process_alive(pid: int) -> bool:
+    """Whether `pid` is a running process we may signal (kill -0)."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def fix_claude_task_notifier() -> str:
+    """Notifier-only recovery for the Claude core, mirroring the Codex one: the
+    canonical launcher, run without --restart, recreates a missing `<session>-watcher`
+    and leaves the live core alone (P1-23: the standby notifier went missing and
+    only a full relaunch brought it back)."""
+    if not _claude_runtime_selected():
+        return "not repaired — Claude runtime is not selected"
+    heartbeat = _fresh_local_core_record()
+    if heartbeat is None:
+        return "not repaired — no fresh local Claude core heartbeat"
+    target = _local_claude_notifier_target(heartbeat)
+    if target is None:
+        return "not repaired — the live Claude core session could not be verified"
+    # The shared launcher injects --restart when the session records another
+    # runtime, and spawns a new core when the heartbeat's process is gone.
+    recorded = _run_tmux(target["socket"], "show-environment", "-t", f"={target['session']}", "SUTANDO_CORE_RUNTIME")
+    if recorded is None or recorded.returncode != 0 or recorded.stdout.strip() != "SUTANDO_CORE_RUNTIME=claude":
+        seen = (recorded.stdout.strip() if recorded is not None and recorded.returncode == 0 else "unreadable")
+        return f"not repaired — the live core records a different runtime ({seen})"
+    core_pid = heartbeat.get("pid")
+    if not isinstance(core_pid, int) or isinstance(core_pid, bool) or not _process_alive(core_pid):
+        return f"not repaired — the heartbeat's core process (pid {core_pid}) is not running"
+    if check_claude_task_notifier()["status"] == "ok":
+        return "already healthy"
+    launcher = REPO_DIR / "src" / "agent" / "start-cli.sh"
+    if not launcher.is_file():
+        return "not repaired — canonical launcher is missing"
+    env = _resolve_launch_env()
+    env["SUTANDO_TMUX_SOCKET"] = target["socket"]
+    env["SUTANDO_TMUX_SESSION"] = target["session"]
+    env["SUTANDO_CORE_RUNTIME"] = "claude"
+    try:
+        launched = subprocess.run(["/bin/bash", str(launcher)], env=env,
+                                  capture_output=True, text=True, timeout=120)
+    except Exception as error:  # noqa: BLE001
+        return f"not repaired — launcher failed ({type(error).__name__})"
+    if launched.returncode != 0:
+        detail = (launched.stderr or launched.stdout).strip().splitlines()
+        suffix = f": {detail[-1][:120]}" if detail else ""
+        return f"not repaired — launcher exited {launched.returncode}{suffix}"
+    if _local_claude_notifier_target(_fresh_local_core_record()) != target:
+        return "not repaired — local Claude core changed during repair"
+    after = check_claude_task_notifier()
+    if after["status"] != "ok":
+        return f"not repaired — {after['detail']}"
+    return "repaired managed notifier; live core session preserved"
+
+
 def fix_codex_task_notifier() -> str:
     """Delegate notifier-only recovery to the canonical runtime launcher.
 
@@ -14876,6 +14939,11 @@ def main():
         if do_fix
         else None
     )
+    claude_notifier = (
+        next((c for c in checks if c["name"] == "claude-task-notifier" and c["status"] == "warn"), None)
+        if do_fix
+        else None
+    )
 
     # skill-symlinks is warn-level, so it is never in `issues`. Its fix pass has
     # to sit ABOVE both gates that follow, because each one independently made
@@ -14969,7 +15037,7 @@ def main():
                 pass
             else:
                 sys.exit(1)
-        elif codex_notifier is None:
+        elif codex_notifier is None and claude_notifier is None:
             sys.exit(0)
 
     # Human-readable
@@ -15109,6 +15177,8 @@ def main():
     # local Codex session and delegates topology to the canonical launcher.
     if codex_notifier:
         print(f"  codex-task-notifier: {fix_codex_task_notifier()}")
+    if claude_notifier:
+        print(f"  claude-task-notifier: {fix_claude_task_notifier()}")
 
     # Channel bridges have the same optional-component shape: "configured but
     # not running" is warn-only, so the fix loop above can't reach a dead
