@@ -4591,6 +4591,63 @@ def _pin_verdicts(service: str, lstart_by_pid: dict) -> list:
         service, lstart_by_pid, time.time())
 
 
+def _phone_server_active_calls(health_url: str = "http://127.0.0.1:3100/health") -> int:
+    """Live calls the phone server reports, 0 when it does not answer (nothing to protect)."""
+    try:
+        import urllib.request as _ur
+        with _ur.urlopen(health_url, timeout=2) as r:
+            d = json.loads(r.read().decode("utf-8", "replace"))
+        n = d.get("activeCalls") if isinstance(d, dict) else 0
+        return int(n) if isinstance(n, (int, float)) and n > 0 else 0
+    except Exception:
+        return 0
+
+
+def _phone_server_launch_argv() -> list:
+    """The bundled artifact when it exists (no tsx in a packaged install), else the source."""
+    bundled = REPO_DIR / "dist" / "conversation-server.js"
+    if bundled.exists():
+        return ["node", str(bundled)]
+    return ["npx", "tsx", "skills/phone-conversation/scripts/conversation-server.ts"]
+
+
+def fix_conversation_server(c: dict, *, settle_s: float = 1.0) -> str:
+    """Restart the phone server, never mid-call: a stale server with live calls is
+    deferred (it drains on SIGTERM, but the owner's call comes first); a stale one
+    is killed only after a re-check right before the kill; the launch is the
+    bundled artifact when it exists."""
+    stale = c.get("status") == "stale"
+    live = _phone_server_active_calls()
+    if stale and live:
+        return f"stale but {live} call(s) active — deferred, run --fix again later"
+    if stale:
+        # Old PIDs first so the new process neither bind-fails nor lands beside a zombie.
+        try:
+            old_pids = subprocess.run(
+                ["/usr/bin/pgrep", "-f", "conversation-server"],
+                capture_output=True, text=True
+            ).stdout.strip().split("\n")
+            old_pids = _filter_pids_this_checkout([p for p in old_pids if p])
+            if _phone_server_active_calls():
+                return "a call started — deferred"
+            for pid in old_pids:
+                if pid:
+                    subprocess.run(["/bin/kill", pid], check=False)
+            time.sleep(settle_s)
+        except Exception:
+            pass
+    subprocess.Popen(_phone_server_launch_argv(),
+                     cwd=str(REPO_DIR),
+                     stdout=open("/tmp/conversation-server.log", "a"),
+                     stderr=subprocess.STDOUT, start_new_session=True)
+    return "restarted (stale code)" if stale else "restarted"
+
+
+def _C_LOCALE_ENV() -> dict:
+    """The environment for a `ps -o lstart` whose output is parsed in English."""
+    return {**os.environ, "LC_ALL": "C"}
+
+
 def _proc_lstarts(pgrep_pattern: str) -> tuple:
     """(start timestamps, {pid: lstart}) for THIS checkout's matching processes.
 
@@ -4618,9 +4675,11 @@ def _proc_lstarts(pgrep_pattern: str) -> tuple:
         pids = _filter_pids_this_checkout(pids)
         if not pids:
             return [], {}
+        # LC_ALL=C: macOS formats lstart in the locale's %c, and a non-English
+        # one broke the English strptime below (P1-19).
         _ps = subprocess.run(
             ["/bin/ps", "-o", "pid=,lstart=", "-p", ",".join(pids)],
-            capture_output=True, text=True, timeout=5
+            capture_output=True, text=True, timeout=5, env=_C_LOCALE_ENV()
         )
         if _ps.returncode != 0:
             return [], None
@@ -12898,10 +12957,13 @@ def run_all_checks() -> list[dict]:
                 c["status"] = "warn"
                 c["detail"] = "not running (starts on demand)"
             else:
+                # The bundled desktop runs dist/conversation-server.js: an engine
+                # update refreshes that artifact without touching the source.
                 mark_stale_if_outdated(
                     c,
                     REPO_DIR / "skills" / "phone-conversation" / "scripts" / "conversation-server.ts",
                     "conversation-server.ts",
+                    binary_path=REPO_DIR / "dist" / "conversation-server.js",
                 )
             # Compose after BOTH branches — the non-ok rewrite replaces check_port's
             # diagnosis, and the healthy branch never composed a pin at all.
@@ -13033,7 +13095,7 @@ def run_all_checks() -> list[dict]:
         try:
             _psb = subprocess.run(
                 ["/bin/ps", "-o", "lstart=", "-p", pids[0]],
-                capture_output=True, text=True, timeout=5
+                capture_output=True, text=True, timeout=5, env=_C_LOCALE_ENV()
             )
             ps_out = _psb.stdout.strip()
             if _psb.returncode == 0 and ps_out:
@@ -15023,25 +15085,7 @@ def main():
                     result = fix_launchd("com.sutando.voice-agent")
                     print(f"  voice-agent (stuck CONNECTING): {result}")
                 elif c["name"] == "conversation-server":
-                    # If stale, kill old PIDs first so the new process doesn't
-                    # bind-fail or end up alongside a still-running zombie.
-                    if c["status"] == "stale":
-                        try:
-                            old_pids = subprocess.run(
-                                ["/usr/bin/pgrep", "-f", "conversation-server.ts"],
-                                capture_output=True, text=True
-                            ).stdout.strip().split("\n")
-                            for pid in old_pids:
-                                if pid:
-                                    subprocess.run(["/bin/kill", pid], check=False)
-                            import time as _t; _t.sleep(1)
-                        except Exception:
-                            pass
-                    subprocess.Popen(["npx", "tsx", "skills/phone-conversation/scripts/conversation-server.ts"],
-                                     cwd=str(REPO_DIR),
-                                     stdout=open("/tmp/conversation-server.log", "a"),
-                                     stderr=subprocess.STDOUT, start_new_session=True)
-                    print(f"  {c['name']}: {'restarted (stale code)' if c['status'] == 'stale' else 'restarted'}")
+                    print(f"  {c['name']}: {fix_conversation_server(c)}")
 
     # Screen-capture (:7845) is optional, so a down server is downgraded to
     # warn and never enters `issues` — the fix loop above can't reach it. An
