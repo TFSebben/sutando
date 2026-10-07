@@ -56,6 +56,36 @@ def _read_when_nonempty(path, deadline):
     return None
 
 
+# A tmux that reports the core session only once new-session has run, so the
+# launcher takes the create-and-poll path rather than "already running".
+SESSION_UP_AFTER_CREATE_TMUX = '''#!/bin/bash
+printf '%s\n' "$*" >> "$TMUX_LOG"
+[ "${1:-}" = -S ] && shift 2
+[ "${1:-}" = new-session ] && : > "$TMUX_STATE.created"
+if [ "${1:-}" = has-session ]; then
+  [ -e "$TMUX_STATE.created" ] && exit 0
+  exit 1
+fi
+exit 0
+'''
+
+# As above, but the session appears only on the third poll after new-session.
+SESSION_UP_THIRD_POLL_TMUX = '''#!/bin/bash
+printf '%s\n' "$*" >> "$TMUX_LOG"
+[ "${1:-}" = -S ] && shift 2
+[ "${1:-}" = new-session ] && : > "$TMUX_STATE.created"
+if [ "${1:-}" = has-session ]; then
+  [ -e "$TMUX_STATE.created" ] || exit 1
+  n="$(cat "$TMUX_STATE.hits" 2>/dev/null || echo 0)"
+  n=$((n + 1))
+  echo "$n" > "$TMUX_STATE.hits"
+  [ "$n" -ge 3 ] && exit 0
+  exit 1
+fi
+exit 0
+'''
+
+
 class CodexCoreLauncherTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -95,6 +125,7 @@ class CodexCoreLauncherTests(unittest.TestCase):
             "src/tasks-dir-resolve.sh",
             "src/watcher_identity.py",
             "src/workspace_default.py",
+            "src/shutdown.py",
             "src/sutando_config.py",
             "scripts/sutando-config.sh",
             # sutando-config.sh sources this; a fixture repo without it dies with
@@ -287,6 +318,7 @@ exit 0
             "SCHEDULER_LOG": str(Path(self.tmp.name) / "scheduler.log"),
             "SUTANDO_CODEX_SCHEDULER_SCRIPT": str(self.root / "fake-codex-scheduler.py"),
             "SUTANDO_HOST_LABEL": "test-host",
+            "SUTANDO_CORE_SESSION_WAIT_S": "0",
         })
         env.update(env_extra or {})
         result = subprocess.run(
@@ -303,6 +335,7 @@ exit 0
         # A suite run from inside a core would otherwise inherit the marker
         # and hit the in-session restart guard instead of the path under test.
         env.pop("SUTANDO_CORE_SESSION", None)
+        env.pop("TMUX", None)   # inherited from a tmux host, it would route to the detached branch
         env.update({
             "PATH": f"{self.bin}:/usr/bin:/bin",
             "TMUX_LOG": str(self.log),
@@ -315,6 +348,7 @@ exit 0
             "HEARTBEAT_LOG": str(Path(self.tmp.name) / "heartbeat.log"),
             "HEARTBEAT_PID": str(Path(self.tmp.name) / "heartbeat.pid"),
             "SUTANDO_HOST_LABEL": "test-host",
+            "SUTANDO_CORE_SESSION_WAIT_S": "0",
         })
         env.update(env_extra or {})
         master, slave = pty.openpty()
@@ -1970,6 +2004,166 @@ exit 0
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("could not prune spent delivery sentinels", result.stderr)
         self.assertEqual((results / "task-owner.txt").read_text(), "done\n")
+
+    def _session_wait_snippet(self):
+        """The real start-cli.sh session-wait block, from SESSION_UP_WAIT_S=... through
+        the SESSION_UP_LABEL line, found by content so the block can grow without
+        silently truncating what this test runs."""
+        script_text = (self.root / "src/agent/codex/cli/start-cli.sh").read_text()
+        lines = script_text.splitlines()
+        start = next(i for i, l in enumerate(lines)
+                     if l.startswith('SESSION_UP_WAIT_S="${SUTANDO_CORE_SESSION_WAIT_S'))
+        end = next(i for i, l in enumerate(lines)
+                   if i >= start and l.startswith("SESSION_UP_LABEL="))
+        return "\n".join(lines[start:end + 1])
+
+    def test_session_wait_knob_validates_and_clamps_hostile_values(self):
+        """The knob degrades to a bounded try count for every hostile shape under
+        the launcher's own set -euo pipefail: a bare word is otherwise an
+        unbound-variable exit and a leading zero an octal error."""
+        snippet = self._session_wait_snippet()
+
+        # tries = clamp(5 * int(value), 1, 300) and the message shows tries / 5;
+        # anything that is not a signed base-10 literal falls back to the default 5.
+        cases = [
+            ("unset", None, "25", "5.0s"),
+            ("empty", "", "25", "5.0s"),
+            ("zero", "0", "1", "0.2s"),
+            ("normal", "5", "25", "5.0s"),
+            ("decimal", "5.7", "25", "5.0s"),
+            ("negative", "-3", "1", "0.2s"),
+            ("negative_leading_zero", "-08", "1", "0.2s"),
+            ("leading_zero", "08", "40", "8.0s"),
+            ("huge", "99999999999999999", "300", "60.0s"),
+            ("non_numeric", "abc", "25", "5.0s"),
+            ("scientific", "1e3", "25", "5.0s"),
+            ("formula_injection", "5 * 1000", "25", "5.0s"),
+            ("bare_sign", "-", "25", "5.0s"),
+            ("bare_dot", ".", "25", "5.0s"),
+            ("leading_dot", ".5", "25", "5.0s"),
+            ("long_zero_prefix", "0" * 100000 + "5", "25", "5.0s"),
+            ("ceiling", "60", "300", "60.0s"),
+            ("just_over_ceiling", "61", "300", "60.0s"),
+            ("zero_padded_ceiling", "0060", "300", "60.0s"),
+            ("all_zeros", "0" * 30, "1", "0.2s"),
+        ]
+        for name, hostile, expected_tries, expected_label in cases:
+            with self.subTest(case=name, hostile=hostile):
+                env = dict(os.environ)
+                env.pop("SUTANDO_CORE_SESSION_WAIT_S", None)
+                if hostile is not None:
+                    env["SUTANDO_CORE_SESSION_WAIT_S"] = hostile
+                started = time.monotonic()
+                result = subprocess.run(
+                    ["/bin/bash", "-c",
+                     "set -euo pipefail\n" + snippet +
+                     '\necho "$SESSION_UP_TRIES"\necho "$SESSION_UP_LABEL"'],
+                    env=env, capture_output=True, text=True, timeout=5,
+                )
+                self.assertLess(time.monotonic() - started, 2.0, f"case={name} parsing stalled")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                out_tries, out_label = result.stdout.splitlines()
+                self.assertEqual(out_tries, expected_tries,
+                                  f"case={name} hostile={hostile!r} stderr={result.stderr!r}")
+                self.assertEqual(out_label, expected_label,
+                                  f"case={name} hostile={hostile!r} stderr={result.stderr!r}")
+
+    def _seed_sentinel(self):
+        p = self.root / "workspace" / "state" / "shutdown.sentinel"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text('{"reason": "test", "ts": 0}\n')
+        return p
+
+    def _calls_after_new_session(self):
+        calls = self.log.read_text().splitlines() if self.log.exists() else []
+        idx = next((i for i, c in enumerate(calls) if " new-session " in f" {c} "), None)
+        return [] if idx is None else calls[idx + 1:]
+
+    def test_launcher_survives_an_invalid_session_wait_value_end_to_end(self):
+        """The real launcher creates the session and clears the sentinel when the
+        knob is garbage, naming the bound it applied; "08" reads as 8."""
+        self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)
+        for hostile, expected_bound in (("abc", "5"), ("1e3", "5"), (".5", "5"), ("08", "8")):
+            with self.subTest(hostile=hostile):
+                for leftover in (self.log, Path(str(Path(self.tmp.name) / "tmux-killed") + ".created")):
+                    leftover.unlink(missing_ok=True)
+                result = self.run_launcher(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": hostile})
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertNotIn("unbound variable", result.stderr)
+                self.assertNotIn("value too great for base", result.stderr)
+                self.assertIn(f"session-up wait: at most {int(expected_bound) * 5} poll(s), {expected_bound}.0s", result.stderr)
+                polls = [c for c in self._calls_after_new_session() if "has-session -t =" in c and "-watcher" not in c]
+                self.assertGreaterEqual(len(polls), 1, "the launcher never polled after new-session")
+                self.assertNotIn("did not come up", result.stderr)
+
+    def test_launcher_times_out_with_the_effective_bound_not_the_raw_value(self):
+        """When the session never appears the warning names the applied budget: a
+        raw 0.9 is one poll and "~0.2s", so raw and effective differ cheaply."""
+        sentinel = self._seed_sentinel()
+        result = self.run_launcher(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "0.9"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("did not come up within ~0.2s", result.stderr)
+        self.assertNotIn("0.9s", result.stderr)
+        self.assertTrue(sentinel.exists(), "a session that never came up must leave the shutdown sentinel in place")
+
+    def test_launcher_prints_the_effective_bound_not_the_raw_huge_value(self):
+        """A huge value is clamped to 300 polls and announced as 60 s before the
+        first poll; the raw digits never reach the output."""
+        self._write_exe("tmux", SESSION_UP_AFTER_CREATE_TMUX)
+        result = self.run_launcher(
+            env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "99999999999999999"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("session-up wait: at most 300 poll(s), 60.0s", result.stderr)
+        self.assertNotIn("99999999999999999", result.stderr)
+
+    def _mutate_launcher(self, old, new):
+        path = self.root / "src/agent/codex/cli/start-cli.sh"
+        text = path.read_text()
+        self.assertEqual(text.count(old), 1, "mutation target must exist exactly once")
+        path.write_text(text.replace(old, new))
+
+    def test_control_a_raw_value_in_the_warning_is_caught(self):
+        """Control: if the timeout warning printed the raw value again, the
+        timeout test would fail on this very output."""
+        self._mutate_launcher('within ~${SESSION_UP_LABEL}', 'within ~${SESSION_UP_WAIT_S}s')
+        result = self.run_launcher(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "0.9"})
+        self.assertIn("did not come up within ~0.9s", result.stderr)
+        self.assertNotIn("within ~0.2s", result.stderr)
+
+    def test_control_a_raw_value_driving_seq_is_caught(self):
+        """Control: if the raw value drove `seq` again, a knob of 1 would give one
+        poll instead of five, the third-poll session would be missed, and the
+        delayed test below would fail on the warning this run produces."""
+        self._mutate_launcher('seq 1 "$SESSION_UP_TRIES"', 'seq 1 "$SESSION_UP_WAIT_S"')
+        self._write_exe("tmux", SESSION_UP_THIRD_POLL_TMUX)
+        result = self.run_launcher(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "1"})
+        self.assertIn("did not come up", result.stderr)
+
+    def test_launcher_delayed_session_still_comes_up_within_the_wait(self):
+        """A session that reports itself on the third poll after new-session is
+        still picked up inside the configured wait, with no timeout warning."""
+        self._write_exe("tmux", SESSION_UP_THIRD_POLL_TMUX)
+        sentinel = self._seed_sentinel()
+        result = self.run_launcher(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "1"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("did not come up", result.stderr)
+        polls = [c for c in self._calls_after_new_session() if "has-session -t =" in c and "-watcher" not in c]
+        self.assertGreaterEqual(len(polls), 3, polls)
+        self.assertFalse(sentinel.exists(), "a session that came up must clear the shutdown sentinel")
+
+    def test_launcher_tty_branch_uses_the_same_session_wait(self):
+        """The interactive branch runs the same create-and-poll unit: a third-poll
+        session comes up under a tty too, with no timeout warning."""
+        self._write_exe("tmux", SESSION_UP_THIRD_POLL_TMUX)
+        sentinel = self._seed_sentinel()
+        result = self.run_launcher_with_tty(env_extra={"SUTANDO_CORE_SESSION_WAIT_S": "1"})
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertNotIn("did not come up", result.stdout)
+        calls = self._calls_after_new_session()
+        polls = [c for c in calls if "has-session -t =" in c and "-watcher" not in c]
+        self.assertGreaterEqual(len(polls), 3, polls)
+        self.assertTrue(any(" attach -t " in f" {c} " for c in calls), "the tty branch ends in attach; it did not run")
+        self.assertFalse(sentinel.exists(), "a session that came up must clear the shutdown sentinel")
 
     def test_worker_one_shot_pending_failure_exits_nonzero_without_typing(self):
         workspace = self.root / "workspace"
