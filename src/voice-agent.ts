@@ -42,7 +42,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { VOICE_TRANSCRIPT_PATH } from './tmp-paths.js';
 import { GeminiBatchSTTProvider, GeminiLiveTranscribeSTTProvider, VoiceSession } from 'bodhi-realtime-agent';
-import { attachMeetingDictation, createMeetingEntryGate } from './meeting-dictation.js';
+import { attachMeetingDictation, createMeetingEntryGate, MEETING_ENTRY_SAY } from './meeting-dictation.js';
 import type { MainAgent, ToolDefinition } from 'bodhi-realtime-agent';
 function assertMacOS() {
 	if (process.platform === 'win32') {
@@ -434,7 +434,7 @@ let meetingActive = false;
 // Meeting mode is bodhi dictation; set once the session exists.
 let meetingDictation: ReturnType<typeof attachMeetingDictation> | null = null;
 // Entering quiesces audio output, so it waits for the spoken confirmation's turn to complete.
-const meetingEntry = createMeetingEntryGate({ fallbackMs: 8_000, onFire: () => enterMeetingDictation() });
+const meetingEntry = createMeetingEntryGate({ fallbackMs: 15_000, onFire: () => enterMeetingDictation() });
 function noteMeetingState(on: boolean) {
 	if (!on) meetingEntry.cancel();
 	meetingActive = on;
@@ -541,7 +541,7 @@ const switchModeTool: ToolDefinition = {
 		console.log(`${ts()} [Meeting] Mode switched to: ${mode}`);
 		if (mode === 'meeting') {
 			meetingEntry.schedule();
-			return { status: 'meeting_mode', transcribing: true };
+			return { status: 'meeting_mode', transcribing: true, say: MEETING_ENTRY_SAY, instruction: `Say exactly this, then end your turn: "${MEETING_ENTRY_SAY}"` };
 		}
 		await meetingDictation?.exit();
 		if (mode === 'presenter') {
