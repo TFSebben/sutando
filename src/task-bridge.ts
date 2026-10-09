@@ -424,10 +424,12 @@ export const _pendingTasksForTest = _pendingTasks;
 // task. A snapshot without engagement is still queued; no snapshot at all (a
 // runtime that never writes one) keeps the submission clock.
 export type TaskActivity = 'started' | 'queued' | 'none';
-const ENGAGED_ROW_KINDS = new Set(['working']);
+const ENGAGED_ROW_KINDS: ReadonlySet<string> = new Set(['working']);
+// The core has read the task: too late to cancel it, though it is not yet engaged.
+const HANDED_OVER_ROW_KINDS: ReadonlySet<string> = new Set(['processing', 'working']);
 
-/** Whether the session's own activity hook recorded real work on the task. */
-export function _taskHasWorkingRow(taskId: string): boolean {
+/** Whether the session's own activity hook recorded a row of `kinds` (default: real work) on the task. */
+export function _taskHasWorkingRow(taskId: string, kinds: ReadonlySet<string> = ENGAGED_ROW_KINDS): boolean {
 	const log = join(REPO_DIR, 'state', 'agent-activity.jsonl');
 	if (!existsSync(log)) return false;
 	try {
@@ -436,7 +438,7 @@ export function _taskHasWorkingRow(taskId: string): boolean {
 			let rec: { projection?: unknown; kind?: unknown; task?: { id?: unknown } };
 			try { rec = JSON.parse(line); } catch { continue; }
 			if (!rec || rec.projection === 'TASK_STATUS' || rec.task?.id !== taskId) continue;
-			if (typeof rec.kind === 'string' && ENGAGED_ROW_KINDS.has(rec.kind)) return true;
+			if (typeof rec.kind === 'string' && kinds.has(rec.kind)) return true;
 		}
 	} catch { /* unreadable log: no evidence */ }
 	return false;
@@ -454,6 +456,86 @@ export function _taskActivity(taskId: string): TaskActivity {
 	} catch {
 		return 'none';
 	}
+}
+
+// Where a voice task stands, from the core's own records, so a cancel reports what the core really did.
+export type VoiceTaskState = 'queued' | 'started' | 'done' | 'cancelled' | 'unknown';
+
+// Queued voice tasks the user asked to cancel.
+const _cancelledVoiceTasks = new Set<string>();
+
+function _activityPhase(taskId: string): string | null {
+	try {
+		const d = JSON.parse(readFileSync(join(REPO_DIR, 'state', 'activity', `${taskId}.json`), 'utf-8')) as { phase?: unknown };
+		return typeof d.phase === 'string' ? d.phase : null;
+	} catch {
+		return null;
+	}
+}
+
+/** A result for the task exists, live or archived (results/archive/YYYY-MM/, this month or last). */
+function _hasResult(taskId: string): boolean {
+	if (existsSync(join(RESULT_DIR, `${taskId}.txt`))) return true;
+	const now = new Date();
+	const last = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 1));
+	return [now, last].some((d) => existsSync(join(RESULT_DIR, 'archive', d.toISOString().slice(0, 7), `${taskId}.txt`)));
+}
+
+/** Where the task stands now. "started" means the core has read it (a processing row) or is engaged. */
+export function voiceTaskState(taskId: string): VoiceTaskState {
+	if (_cancelledVoiceTasks.has(taskId)) return 'cancelled';
+	if (_hasResult(taskId)) return 'done';
+	const phase = _activityPhase(taskId);
+	if (phase === 'COMPLETED' || phase === 'FAILED') return 'done';
+	if (phase === 'CANCELLED') return 'cancelled';
+	if (_taskHasWorkingRow(taskId, HANDED_OVER_ROW_KINDS)) return 'started';
+	const activity = _taskActivity(taskId);
+	if (activity !== 'none') return activity;
+	// No snapshot: a task file still in tasks/ is queued; one the core took may be running.
+	if (existsSync(join(TASK_DIR, `${taskId}.txt`))) return 'queued';
+	return _pendingTasks.has(taskId) ? 'started' : 'unknown';
+}
+
+/** The task "cancel it" means: the latest `work` task this session submitted that is still open. */
+export function latestOpenVoiceTask(): string | undefined {
+	let latest: string | undefined;
+	let at = -Infinity;
+	for (const [id, p] of _pendingTasks) {
+		if (_cancelledVoiceTasks.has(id) || p.submittedAt < at) continue;
+		latest = id;
+		at = p.submittedAt;
+	}
+	return latest;
+}
+
+/** The open voice task whose text contains `query` (case-insensitive), latest first. */
+export function findOpenVoiceTask(query: string): string | undefined {
+	const needle = query.toLowerCase();
+	return [..._pendingTasks.entries()]
+		.filter(([id, p]) => !_cancelledVoiceTasks.has(id) && p.taskText.toLowerCase().includes(needle))
+		.sort((a, b) => b[1].submittedAt - a[1].submittedAt)[0]?.[0];
+}
+
+/** A task the voice agent submitted: only these may be reported as cancelled outright. */
+export function isVoiceSubmittedTask(taskId: string): boolean {
+	return _pendingTasks.has(taskId) || _isVoiceTask(taskId);
+}
+
+/** A queued voice task the user asked to cancel: delete its file; the core's reply to the instruction confirms. */
+export function noteVoiceTaskCancelled(taskId: string): void {
+	_cancelledVoiceTasks.add(taskId);
+	_pendingTasks.delete(taskId);
+	// Deleted, not archived: a core that misses the file looks in tasks/archive/ and runs what it finds there.
+	try { unlinkSync(join(TASK_DIR, `${taskId}.txt`)); } catch { /* already gone */ }
+	_sendTaskStatus?.(taskId, 'done', 'Cancel requested.');
+}
+
+/** A task the user asked to cancel that the core ran anyway. */
+export const CANCELLED_BUT_FINISHED_NOTE = 'The user asked to cancel this task, but the core had already taken it and it finished. Tell them in one sentence that it finished anyway.';
+
+/** Test-only: forget cancels between cases. */
+export function _resetVoiceTaskCancelsForTest(): void {
+	_cancelledVoiceTasks.clear();
 }
 
 // Dedup window: identical task text within 2 minutes → return existing taskId.
@@ -1621,6 +1703,7 @@ export function startResultWatcher(onResult: ResultListener, isClientConnected: 
 					const keptToDm = taskOrigin ? keepVoiceResultToDm(taskId, result, dmOnly) : null;
 					if (keptToDm) onResult(result, taskOrigin?.dmOnlyNote ?? DM_ONLY_DELIVERY_NOTE);
 					else if (taskOrigin) void _deliverOriginBoundResult(taskId, result, taskOrigin, onResult);
+					else if (_cancelledVoiceTasks.has(taskId)) onResult(result, CANCELLED_BUT_FINISHED_NOTE);
 					else onResult(result);
 					// Notify agent-api directly (task results only), then delete file
 					if (registersTask) {
