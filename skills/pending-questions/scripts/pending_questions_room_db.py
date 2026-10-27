@@ -24,7 +24,9 @@ the row (committing the history marker first when the row is in view and the mar
 a marker that cannot be written leaves the row open and records the close locally), else
 records the closure locally for the next reconcile — only for a question held in the outbox,
 or in outage mode once a row of this workspace was ever confirmed; an unknown id with neither
-is refused and changes no count. `remind` is the reminder.
+is refused and changes no count; a question's decision card is retired with it. `clicks` and
+`ack_click` hand each card click to one consumer (`pending_questions_clicks`). `remind` is the
+reminder.
 
 `serve` answers one pending_questions_store.DbClient request (JSON on stdin) over
 one connection to the room's databases document, writing only the DATABASE.md
@@ -48,6 +50,7 @@ for _p in (REPO / "src", HERE):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 import pending_questions_ask as core_ask
+import pending_questions_clicks as cards
 from pending_questions_outbox import (Outbox as HeldRecords, local_closes, mark_room_introduced,
                                       mark_store_used, room_introduced, store_history)
 from pending_questions_store import (DB_SCHEMA, INCOMPLETE, TERMINAL, GuardFailed, Outbox, Question,
@@ -66,6 +69,8 @@ SETTLE_SEC = 1.0
 ROOM_KEY = "PENDING_QUESTIONS_ROOM"
 # The collab service URL; set, it overrides the capability's own resolution (an outage rehearsal).
 URL_KEY = "PENDING_QUESTIONS_COLLAB_URL"
+# `resolve`'s answer when the room saw the row and refused the close (closed already, no such row).
+REFUSED_PREFIX = "room database: not changed"
 
 
 def skill_scripts(workspace: Path) -> Optional[Path]:
@@ -267,7 +272,22 @@ def _close_locally(ws: Path, ask_id: str, status: str, why: str, basis: Optional
     return True, f"recorded locally as {status} in {p} ({why}; {basis}); the next reconcile applies it to the row"
 
 
-def resolve(workspace: Path, ask_id: str, status: str) -> tuple:
+def resolve(workspace: Path, ask_id: str, status: str, manager=None) -> tuple:
+    """`_close_row`, then the question's decision card is retired once the row is closed (or recorded
+    closed) or the room refuses the close, so no later click can read as a decision."""
+    ok, msg = _close_row(workspace, ask_id, status)
+    if ok or msg.startswith(REFUSED_PREFIX):
+        try:
+            gone = cards.retire_cards(manager or cards.manager_for(workspace), ask_id)
+        except Exception as e:  # noqa: BLE001 — the row's close stands; a live card is only reported
+            msg += f"; its decision card could not be retired ({type(e).__name__}: {e})"
+        else:
+            if gone:
+                msg += f"; decision card {', '.join(gone)} retired"
+    return ok, msg
+
+
+def _close_row(workspace: Path, ask_id: str, status: str) -> tuple:
     """(closed, message): the row's Closed cell takes `status` (Answered or Resolved) after a
     reconcile files any held question; a store that cannot be written leaves a local close
     record instead. A row in view before the history marker was ever committed commits it
@@ -292,9 +312,53 @@ def resolve(workspace: Path, ask_id: str, status: str) -> tuple:
     except GuardFailed as g:
         if not g.current and any(e["ask_id"] == ask_id for e in Outbox(ws).entries()):
             return _close_locally(ws, ask_id, status, "its held entry has no row yet")
-        return False, f"room database: not changed — {type(g).__name__}: {g}"
+        return False, f"{REFUSED_PREFIX} — {type(g).__name__}: {g}"
     except Exception as e:  # noqa: BLE001
         return _close_locally(ws, ask_id, status, f"room database unreachable ({type(e).__name__}: {e})")
+
+
+def _close_for_click(ws: Path, ask_id: str, token: str) -> tuple:
+    """(closed | stale | deferred, message) for a click claim. Only the room itself can say the
+    owner's Status is open, so there is no local fallback: anything it cannot verify defers."""
+    from util_paths import host_label
+    store, where = room_store(ws)
+    if store is None:
+        return cards.DEFERRED, f"deferred: room database not used ({where}); the owner's Status cannot be checked"
+    try:
+        with getattr(store, "operation", nullcontext)():
+            reconcile_pending(store, ws, host_label())
+            if not store_history(ws) and store.status_of(ask_id) is not None:
+                Outbox(ws).commit_history(ask_id)
+            store.close(ask_id, "Answered", require_open=True, token=token)
+            return cards.CLOSED, f"room database: {ask_id} -> Answered in {store.where(ask_id)}"
+    except GuardFailed as g:
+        if g.current.get("status") in TERMINAL:  # the owner's own answer wins, whatever any mark says
+            return cards.STALE, f"{REFUSED_PREFIX} — the owner set {g.current['status']} — {type(g).__name__}: {g}"
+        if not g.current:
+            return cards.DEFERRED, f"deferred: {ask_id} has no row in the room yet"
+        try:
+            ours = store.click_token_of(ask_id) == token
+        except Exception as e:  # noqa: BLE001
+            return cards.DEFERRED, f"deferred: the row's click mark cannot be read ({type(e).__name__}: {e})"
+        if ours:
+            return cards.CLOSED, f"room database: {ask_id} closed earlier by this claim"
+        return cards.STALE, f"{REFUSED_PREFIX} — {type(g).__name__}: {g}"
+    except Exception as e:  # noqa: BLE001
+        return cards.DEFERRED, f"deferred: room database unreachable ({type(e).__name__}: {e})"
+
+
+def clicks(workspace: Path, manager=None, now=None) -> list:
+    """The owner's decision-card clicks, each handed over as an actionable choice once, and again
+    only after an unacked lease (pending_questions_clicks); the row closes through this adapter."""
+    return cards.clicks(Path(workspace), _close_for_click, manager, now)
+
+
+def due_clicks(workspace: Path, manager=None, now=None) -> list:
+    return cards.due_clicks(Path(workspace), manager, now)
+
+
+def ack_click(workspace: Path, ask_id: str, token: str, manager=None) -> tuple:
+    return cards.ack_click(Path(workspace), ask_id, token, manager)
 
 
 # ---- the ask ----------------------------------------------------------------------

@@ -283,6 +283,17 @@ def _mark(cells: dict, prop: str) -> Optional[str]:
     return val if val and (tag or None) == (cells.get("host") or None) else None
 
 
+# A click claim's close leaves its token in the Recovery cell ("click:<token>@<host>") beside a
+# plain Closed mark, so a reader that predates tokens still reads the row as closed.
+CLICK_MARK = "click:"
+
+
+def click_token(cells: dict) -> Optional[str]:
+    """The click claim token this row's own host left in Recovery, or None."""
+    val = _mark(cells, "recovery") or ""
+    return val[len(CLICK_MARK):] or None if val.startswith(CLICK_MARK) else None
+
+
 def effective_status(cells: dict) -> str:
     """The owner's terminal Status wins; then the row's Closed mark; else Open."""
     closed = _mark(cells, "closed")
@@ -379,11 +390,19 @@ class RoomDbStore:
     def _tag(self, value: str) -> str:
         return f"{value}@{self.host}" if self.host else value
 
-    def close(self, ask_id: str, to: str) -> None:
-        """Record a closure made by code in the Closed cell; Status stays the owner's."""
+    def close(self, ask_id: str, to: str, require_open: bool = False, token: Optional[str] = None) -> None:
+        """Record a closure made by code in the Closed cell; Status stays the owner's.
+        `require_open`: an owner's terminal Status refuses the close in the same guarded write.
+        `token`: the click claim closing it, left in Recovery in the same write (see CLICK_MARK)."""
         if to not in TERMINAL:
             raise StoreError(f"code only closes a row; {to!r} is not Answered or Resolved")
-        self._guarded(ask_id, {"closed": self._tag(to)}, {"closed": [None]})
+        expect = {"closed": [None], **({"status": OPEN_RAW} if require_open else {})}
+        cells = {"closed": self._tag(to), **({"recovery": self._tag(CLICK_MARK + token)} if token else {})}
+        self._guarded(ask_id, cells, expect)
+
+    def click_token_of(self, ask_id: str) -> Optional[str]:
+        r = self.client.row(DB_SCHEMA, self._rid(ask_id))
+        return click_token((r or {}).get("cells") or {})
 
     def clear(self, ask_id: str, props: list) -> None:
         """Remove stale code marks from this host's row; Status is not touched."""
