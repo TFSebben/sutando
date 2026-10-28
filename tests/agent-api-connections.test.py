@@ -96,8 +96,16 @@ def fetch(url, token, address=None):
 DEAD_PID = 4_194_404
 
 
+# Set while a promote runs: the spawned bridge also reports the gateway poll promote waits for.
+CONNECTS = []
+
+
 def spawn(argv, env, log_path):
     SPAWNED.append(env["GATEWAY_INSTANCE"])
+    if CONNECTS:
+        status = WS / "state" / f"gateway-status.{env['GATEWAY_INSTANCE']}.json"
+        status.parent.mkdir(parents=True, exist_ok=True)
+        status.write_text(json.dumps({"pid": DEAD_PID, "connected": True}))
     return DEAD_PID
 
 
@@ -172,6 +180,8 @@ for method, path, body in (("GET", "/api/v1/connections", None),
                            ("DELETE", "/api/v1/connections/x?force=1", None),
                            ("POST", "/api/v1/connections/x/primary", {}),
                            ("GET", "/api/v1/connections/known-servers", None),
+                           ("POST", "/api/v1/connections/x/promote", {}),
+                           ("POST", "/api/v1/connections/x/unpark", {}),
                            ("POST", "/api/v1/connections/x/disconnect", {}),
                            ("POST", "/api/v1/connections/x/reconnect", {}),
                            ("POST", "/api/v1/connections/x/token", {"token": TOKEN_A})):
@@ -427,6 +437,29 @@ check("exactly one primary after the move", [r["primary"] for r in b["connection
 s, b, _ = req("POST", "/api/v1/connections/alpha-fixture-net/reconnect", {})
 check("reconnect is 202 with a launch record", s == 202 and b["launch"]["ok"] is True and b["launch"]["pid"] == DEAD_PID, f"{s} {b}")
 check("reconnect spawned exactly that bridge", SPAWNED == ["alpha-fixture-net"], SPAWNED)
+CONNECTS.append(True)
+s, b, _ = req("POST", "/api/v1/connections/alpha-fixture-net/promote", {})
+check("promote is 200 naming the parked row", s == 200 and (b["connection"]["primary"], b["previous"], b["changed"],
+      b["relaunch_needed"]) == (True, "beta-fixture-net", True, False), f"{s} {b}")
+s, b, _ = req("GET", "/api/v1/connections")
+check("the old primary is parked, not removed", [(r["instance"], r["primary"], r["parked"], r["reason"]) for r in b["connections"]]
+      == [("alpha-fixture-net", True, False, None), ("beta-fixture-net", False, True, "parked")], b)
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/unpark", {})
+check("unpark is 200 and starts the bridge", s == 200 and b["connection"]["parked"] is False and b["launch"]["ok"] is True, f"{s} {b}")
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/promote", {})
+check("a promote back is 200", s == 200 and b["previous"] == "alpha-fixture-net", f"{s} {b}")
+s, b, _ = req("POST", "/api/v1/connections/beta-fixture-net/promote", {})
+check("promoting the primary again changes nothing", s == 200 and (b["changed"], b["previous"]) == (False, None), f"{s} {b}")
+CONNECTS.clear()
+with C._transaction(WS) as rec:
+    rec[C.LEGACY_PARKED_KEY] = True
+s, b, _ = req("POST", "/api/v1/connections/legacy/unpark", {})
+check("POST /connections/legacy/unpark reaches the legacy row (instance '')", s == 200 and
+      (b["connection"]["instance"], b["connection"]["legacy"], b["connection"]["parked"], b["launch"]) == ("", True, False, None),
+      f"{s} {b}")
+check("and clears its park", C.legacy_parked(WS) is False)
+s, b, _ = req("GET", "/api/v1/connections")
+check("named rows say legacy false", [r["legacy"] for r in b["connections"]] == [False, False], b)
 s, b, _ = req("DELETE", "/api/v1/connections/beta-fixture-net")
 check("deleting the primary is 409 primary", (s, b) == (409, {"error": "primary"}), f"{s} {b}")
 s, b, h = req("DELETE", "/api/v1/connections/alpha-fixture-net")

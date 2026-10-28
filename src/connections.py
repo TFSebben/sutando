@@ -41,6 +41,13 @@ environment variable) would shadow the vault. The legacy unsuffixed row is the e
 `disconnect` and `update_token` refuse it (`LegacyRowUnmanaged`). Every such refusal is a
 `Refusal` whose `CODE` each surface returns unchanged.
 
+`promote` moves the primary in one operation while the old primary's bridge runs, the legacy one
+included: it flips the primary, (re)launches the new row's bridge so it carries the proactive room,
+waits for that bridge to report a gateway poll, then stops the old owner's through the same stop
+path and marks the old row `parked` under one hold of the record lock. A parked row stays in the
+record, the plan skips it and the legacy bridge stands down on it (`legacy_parked`), until
+`unpark` (or a `promote` back) clears the flag.
+
 A row's `server_source` says where its server came from: `identity` (the resolver's
 registered DotSpace for the gateway host, confirmed by the gateway's own agent listing),
 `resolver` (the registered DotSpace alone) or `gateway` (the host itself, provisional). Two
@@ -90,8 +97,10 @@ STATES = ("pending", "connected", "disconnected", "failed", "parked")
 SERVER_SOURCES = ("identity", "resolver", "gateway")
 # The bridge's own GATEWAY_INSTANCE charset; a row that fails it could never launch.
 INSTANCE_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+# The HTTP path segment that names the legacy row, whose instance is "" (an empty segment is dropped).
+LEGACY_PATH_SEGMENT = "legacy"
 # Fixed names on the HTTP resource: a row so named could never be addressed there.
-RESERVED_INSTANCES = ("known-servers", "token")
+RESERVED_INSTANCES = ("known-servers", "token", LEGACY_PATH_SEGMENT)
 _ENV_VAR_RE = re.compile(r"^AG2_REMOTE_TOKEN_([A-Za-z0-9_]+)$")
 _MXID_RE = re.compile(r"^@[^:]+:([A-Za-z0-9.-]+)(?::\d+)?$")
 _REQUIRED = ("server", "instance", "gateway_url", "token_ref", "primary", "added_by", "added_at", "verified",
@@ -101,6 +110,8 @@ IDENTITY_FIELDS = ("agent_mxid", "agent_display_name", "agent_avatar_url", "owne
 AVATAR_SCHEME = "mxc://"
 PROBE_TIMEOUT_S = 15
 STOP_TIMEOUT_S = 8
+# How long `promote` waits for the new bridge to report a gateway poll; outlasts its first long poll.
+CONNECT_TIMEOUT_S = 60
 VAULT_PROBE_WAIT_S = 2  # outlasts a chat interception's brief write, never a hung holder
 # How long `launch` holds the record lock waiting for its child to take the bridge lease.
 LEASE_TIMEOUT_S = 20
@@ -161,6 +172,56 @@ class DisabledCannotBePrimary(Refusal):
 
     def __init__(self, instance: str):
         super().__init__(f"{self.CODE}: {instance} is disconnected; reconnect it before making it primary")
+
+
+class ParkedCannotBePrimary(Refusal):
+    """A parked row does not launch; `promote` brings it back as the primary, `unpark` as a secondary."""
+
+    CODE = "parked_cannot_be_primary"
+
+    def __init__(self, instance: str):
+        super().__init__(f"{self.CODE}: {instance or 'the legacy row'} is parked; promote it, or unpark it first")
+
+
+class LegacyBridgeNotRunning(Refusal):
+    """The engine never launches the legacy bridge, so promoting its row needs it already up."""
+
+    CODE = "legacy_bridge_not_running"
+
+    def __init__(self):
+        super().__init__(f"{self.CODE}: the legacy unsuffixed bridge is not running; unpark it, start it "
+                         "(bash src/startup.sh), then promote it; nothing changed")
+
+
+class NewPrimaryNotStarted(Refusal):
+    """`promote` could not start the new row's bridge; the old primary was never touched."""
+
+    CODE = "new_primary_not_started"
+
+    def __init__(self, instance: str, reason: str):
+        super().__init__(f"{self.CODE}: the bridge for {instance} did not start ({reason}); the primary did not move")
+        self.reason = reason
+
+
+class NewPrimaryNotConnected(Refusal):
+    """The new row's bridge started but the gateway never accepted its token in time; rolled back."""
+
+    CODE = "new_primary_not_connected"
+
+    def __init__(self, instance: str, reason: str):
+        super().__init__(f"{self.CODE}: the bridge for {instance} did not connect ({reason}); "
+                         "the old primary kept running and the primary did not move")
+        self.reason = reason
+
+
+class PromoteConflict(Refusal):
+    """The primary moved, or the row `promote` was to park changed, while it waited for the new bridge."""
+
+    CODE = "promote_conflict"
+
+    def __init__(self, instance: str):
+        super().__init__(f"{self.CODE}: the primary moved while {instance} was connecting; the other change "
+                         "stands, the bridge this call started is stopped and nothing was parked")
 
 
 class LegacyRowUnmanaged(Refusal):
@@ -699,8 +760,9 @@ def _validate_row(row: object, index: int) -> dict:
     if row["server_source"] not in SERVER_SOURCES:
         raise SchemaError(f"connections.json: row {index} server_source {row['server_source']!r} unknown")
     # Absent on rows written before the flag existed: those load as enabled.
-    if "disabled" in row and not isinstance(row["disabled"], bool):
-        raise SchemaError(f"connections.json: row {index} field disabled is not a boolean")
+    for key in ("disabled", "parked"):
+        if key in row and not isinstance(row[key], bool):
+            raise SchemaError(f"connections.json: row {index} field {key} is not a boolean")
     keys = row.get("launch_keys", [])
     if not isinstance(keys, list) or not all(isinstance(k, str) and _ENV_VAR_RE.match(k) for k in keys):
         raise SchemaError(f"connections.json: row {index} launch_keys is not a list of AG2_REMOTE_TOKEN_<INST> names")
@@ -708,6 +770,8 @@ def _validate_row(row: object, index: int) -> dict:
 
 
 REMOVED_KEY = "removed_env"
+# Record-level park of a legacy bridge that has no row of its own (a named row covers its server).
+LEGACY_PARKED_KEY = "legacy_parked"
 
 
 def _validate(payload: object) -> dict:
@@ -729,14 +793,17 @@ def _validate(payload: object) -> dict:
     removed = payload.get(REMOVED_KEY, [])
     if not isinstance(removed, list) or not all(isinstance(x, str) for x in removed):
         raise SchemaError(f"connections.json: '{REMOVED_KEY}' is not a list of names")
-    return {"rows": rows, REMOVED_KEY: sorted(set(removed))}
+    parked = payload.get(LEGACY_PARKED_KEY, False)
+    if not isinstance(parked, bool):
+        raise SchemaError(f"connections.json: '{LEGACY_PARKED_KEY}' is not a boolean")
+    return {"rows": rows, REMOVED_KEY: sorted(set(removed)), LEGACY_PARKED_KEY: parked}
 
 
 def _read_record(path: Path) -> dict:
     try:
         size = path.stat().st_size
     except FileNotFoundError:
-        return {"rows": [], REMOVED_KEY: []}
+        return {"rows": [], REMOVED_KEY: [], LEGACY_PARKED_KEY: False}
     if size > MAX_BYTES:
         raise SchemaError(f"connections.json: {size} bytes exceeds the {MAX_BYTES}-byte bound")
     try:
@@ -773,6 +840,8 @@ def _atomic_json(path: Path, payload: dict) -> None:
 def _write(path: Path, record: dict) -> None:
     payload = {"schema_version": SCHEMA_VERSION, "connections": record["rows"],
                REMOVED_KEY: sorted(set(record[REMOVED_KEY]))}
+    if record.get(LEGACY_PARKED_KEY):
+        payload[LEGACY_PARKED_KEY] = True
     _validate(payload)
     _atomic_json(path, payload)
 
@@ -1036,6 +1105,19 @@ def legacy_keeps_proactive_room(workspace: Optional[Path] = None) -> bool:
     return not any(r["primary"] and r["instance"] for r in rows)
 
 
+def legacy_parked(workspace: Optional[Path] = None) -> bool:
+    """Whether a primary move parked the legacy row, or the legacy bridge that has no row: asked by
+    its launchers before they spawn it and by the bridge right after it takes its lease. Under the
+    record lock, so a `promote` that is stopping it commits first; an unreadable record parks nothing
+    (the env-only fail-open)."""
+    try:
+        with locked_file(_lock_path(workspace), create_mode=0o600):
+            rec = _read_record(record_path(workspace))
+    except (SchemaError, OSError):
+        return False
+    return rec[LEGACY_PARKED_KEY] or any(not r["instance"] and r.get("parked") for r in rec["rows"])
+
+
 def owns_unaddressed(instance: str, workspace: Optional[Path] = None) -> bool:
     """Whether the bridge running as `instance` owns unaddressed proactive messages and the owner's
     cards: the primary row's bridge, under its slug or a launch-key alias. With no named primary, or
@@ -1051,15 +1133,18 @@ def owns_unaddressed(instance: str, workspace: Optional[Path] = None) -> bool:
 
 def set_primary(instance: str, *, workspace: Optional[Path] = None) -> dict:
     """Make `instance` the primary; proactive and owner-DM defaults follow it at the next launch.
-    Refused before anything is written: a disabled row (`DisabledCannotBePrimary`: it never
-    launches); any named promotion while the legacy bridge runs, whatever the record's primary
-    (`LegacyPrimaryRunning`: it settles the room once, at start, so it may hold it); a lease that
-    proves no holder (`BridgeLeaseIndeterminate`). The returned row carries `relaunch_needed`: true when the
-    new primary's bridge is running, since it keeps its launch environment until `reconnect`."""
+    Refused before anything is written: a disabled or parked row (`DisabledCannotBePrimary`,
+    `ParkedCannotBePrimary`: neither launches); any named promotion while the legacy bridge runs,
+    whatever the record's primary (`LegacyPrimaryRunning`: it settles the room once, at start, so it
+    may hold it); a lease that proves no holder (`BridgeLeaseIndeterminate`). The returned row carries
+    `relaunch_needed`: true when the new primary's bridge is running, since it keeps its launch
+    environment until `reconnect`."""
     with _transaction(workspace) as rec:
         row = _find(rec["rows"], instance)
         if row.get("disabled"):
             raise DisabledCannotBePrimary(instance)
+        if row.get("parked"):
+            raise ParkedCannotBePrimary(instance)
         promoted = not row["primary"]
         if promoted and instance:
             legacy = bridge_pid("", workspace)
@@ -1070,6 +1155,206 @@ def set_primary(instance: str, *, workspace: Optional[Path] = None) -> dict:
             r["primary"] = r is row
     out = dict(row)
     out["relaunch_needed"] = relaunch
+    return out
+
+
+def _owner_row(rows: list, workspace: Optional[Path]) -> Optional[dict]:
+    """The row whose bridge owns unaddressed messages now (`owns_unaddressed`): the primary, else
+    the legacy row while its bridge runs."""
+    primary = next((r for r in rows if r["primary"]), None)
+    if primary is not None:
+        return primary
+    legacy = next((r for r in rows if not r["instance"]), None)
+    return legacy if legacy is not None and bridge_pid("", workspace) else None
+
+
+def promote(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, str]] = None,
+            workspace: Optional[Path] = None, vault=None, spawn=None, kill=None,
+            python: Optional[str] = None, connect_timeout_s: Optional[float] = None) -> dict:
+    """Make `instance` the primary while the old primary's bridge may still run, the legacy one included.
+
+    In order: under the record lock, clear the row's `parked` flag and flip the primary to it, so
+    `launch_env` gives its bridge the proactive room; stop the row's bridge if one runs (it was
+    launched as a secondary, without the room) and `start` it; wait up to `CONNECT_TIMEOUT_S` for
+    that bridge's own status to show the gateway accepted its token; then, under one hold of the
+    record lock, stop the old owner's bridge (`_owner_row` before the flip, by the stop path
+    `disconnect` uses) and mark that row `parked`. A legacy bridge with no row of its own (a named
+    row covers its server) is stopped and parked as well (`legacy_parked`). Ownership moves at the
+    flip (`owns_unaddressed` reads the record per pass): until the new bridge polls nobody owns
+    unaddressed messages, and they wait. Refused before anything changes: a disabled row. A start
+    that fails is `NewPrimaryNotStarted`, one that never connects `NewPrimaryNotConnected`; those,
+    a refused stop (`BridgeStillRunning`, `BridgeLeaseIndeterminate`) and `PromoteConflict` (the
+    primary moved, or the row to park was removed or parked, while it waited) re-raise after the
+    rollback: the primary flag (never over a newer move) and a cleared `parked` flag are restored,
+    a bridge this call started is stopped and one it stopped is started again, and the old bridge was never touched
+    (a rowless legacy bridge already stopped stays parked). The legacy row is `_promote_legacy`.
+    Idempotent: on the current primary it only starts the bridge if it is down. The row carries
+    `previous` (the parked instance, None when nothing was parked), `stopped_pid`,
+    `legacy_stopped_pid`, `launch`, `changed` and `relaunch_needed` (the new primary's bridge
+    runs without the room: one that was up under another launch and could not be relaunched)."""
+    if not instance:
+        return _promote_legacy(workspace, kill)
+    with _transaction(workspace) as rec:
+        row = _find(rec["rows"], instance)
+        if row.get("disabled"):
+            raise DisabledCannotBePrimary(instance)
+        before = next((r["instance"] for r in rec["rows"] if r["primary"]), None)
+        old = _owner_row(rec["rows"], workspace)
+        old_inst = None if old is None or old is row else old["instance"]
+        was_parked, was_primary = bool(row.pop("parked", False)), row["primary"]
+        for r in rec["rows"]:
+            r["primary"] = r is row
+        snapshot = dict(row)
+    undo = {"instance": instance, "before": before, "was_parked": was_parked, "workspace": workspace,
+            "kill": kill, "started": 0, "relaunched": False}
+    start_kw = dict(repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace, vault=vault,
+                    spawn=spawn, python=python)
+    try:
+        if not was_primary:
+            undo["relaunched"] = bool(_stop_row(snapshot, workspace, kill))
+        launch = start(instance, **start_kw)
+        if not launch.get("ok"):
+            raise NewPrimaryNotStarted(instance, str(launch.get("reason") or "launch_failed"))
+        undo["started"] = int(launch.get("pid") or 0) if launch.get("lease") == "held" else 0
+        _await_connected(instance, int(launch.get("holder_pid") or launch.get("pid") or 0), workspace,
+                         CONNECT_TIMEOUT_S if connect_timeout_s is None else connect_timeout_s)
+    except ConnectionsError:
+        with locked_file(_lock_path(workspace), create_mode=0o600):
+            _undo_promote(_read_record(record_path(workspace)), **undo)
+        _restart_secondary(undo, start_kw)
+        raise
+    path = record_path(workspace)
+    failure = None
+    with locked_file(_lock_path(workspace), create_mode=0o600):
+        rec = _read_record(path)
+        row = next((r for r in rec["rows"] if r["instance"] == instance), None)
+        old = next((r for r in rec["rows"] if old_inst is not None and r["instance"] == old_inst), None)
+        stopped = legacy_stopped = 0
+        try:
+            # Another writer may have moved the primary while the new bridge connected.
+            if row is None or not row["primary"] or (old_inst is not None and (old is None or old.get("parked"))):
+                raise PromoteConflict(instance)
+            if row.get("disabled"):
+                raise DisabledCannotBePrimary(instance)
+            if not any(not r["instance"] for r in rec["rows"]):
+                legacy_stopped = stop_bridge("", workspace=workspace, kill=kill)
+                rec[LEGACY_PARKED_KEY] = rec[LEGACY_PARKED_KEY] or bool(legacy_stopped)
+            stopped = _stop_row(old, workspace, kill) if old is not None else 0
+        except ConnectionsError as e:
+            _undo_promote(rec, **undo, restore_primary=not isinstance(e, PromoteConflict))
+            failure = e
+        else:
+            if old is not None:
+                old["parked"] = True
+            row.pop("parked", None)
+            for r in rec["rows"]:
+                r["primary"] = r is row
+            _write(path, rec)
+    if failure is not None:
+        _restart_secondary(undo, start_kw)
+        raise failure
+    out = dict(row)
+    out.update(previous=None if old is None else old["instance"], stopped_pid=stopped,
+               legacy_stopped_pid=legacy_stopped, launch=launch,
+               changed=old is not None or bool(legacy_stopped) or was_parked or not was_primary,
+               relaunch_needed=launch.get("lease") in ("already_running", "alias_running") and not was_primary)
+    return out
+
+
+def _promote_legacy(workspace: Optional[Path], kill) -> dict:
+    """`promote('')`: the engine never launches the legacy bridge, so it must already run
+    (`LegacyBridgeNotRunning`); under one hold of the record lock stop the old owner's bridge, park
+    its row and flip. That bridge settled the proactive room when it started, so with a named
+    primary then it runs without the room and the row carries `relaunch_needed`: its launchers
+    restart it (`bash src/restart.sh`)."""
+    path = record_path(workspace)
+    with locked_file(_lock_path(workspace), create_mode=0o600):
+        rec = _read_record(path)
+        row = _find(rec["rows"], "")
+        if row.get("disabled"):
+            raise DisabledCannotBePrimary("")
+        if not bridge_pid("", workspace):
+            raise LegacyBridgeNotRunning()
+        was_parked, was_primary = bool(row.get("parked")), row["primary"]
+        old = _owner_row(rec["rows"], workspace)
+        old = None if old is row else old
+        stopped = _stop_row(old, workspace, kill) if old is not None else 0
+        if old is not None:
+            old["parked"] = True
+        row.pop("parked", None)
+        rec[LEGACY_PARKED_KEY] = False
+        for r in rec["rows"]:
+            r["primary"] = r is row
+        _write(path, rec)
+    out = dict(row)
+    out.update(previous=None if old is None else old["instance"], stopped_pid=stopped, legacy_stopped_pid=0,
+               launch=None, changed=old is not None or was_parked or not was_primary,
+               relaunch_needed=bool(old is not None and old["instance"]))
+    return out
+
+
+def _await_connected(instance: str, pid: int, workspace: Optional[Path], timeout_s: float) -> None:
+    """Until the deadline: return once `pid`'s own status file says the gateway answered its poll;
+    `NewPrimaryNotConnected` when that status shows the token rejected, the bridge exits, or time runs out."""
+    deadline = time.monotonic() + timeout_s
+    while True:
+        sidecar = _sidecar(instance, workspace)
+        if pid and sidecar.get("pid") == pid:
+            if sidecar.get("connected"):
+                return
+            if derive_state(sidecar, {})[1] == "auth_rejected":
+                raise NewPrimaryNotConnected(instance, "auth_rejected")
+        if not pid or _exited(pid):
+            raise NewPrimaryNotConnected(instance, "exited")
+        if time.monotonic() >= deadline:
+            raise NewPrimaryNotConnected(instance, "timeout")
+        time.sleep(0.2)
+
+
+def _undo_promote(rec: dict, *, instance: str, before: Optional[str], was_parked: bool,
+                  workspace: Optional[Path], kill, started: int, relaunched: bool,
+                  restore_primary: bool = True) -> None:
+    """Under the record lock: stop the bridge `promote` started, put the primary back on `before`
+    (unless another writer moved it since) and restore the row's `parked` flag; a bridge that will
+    not stop keeps the row unparked."""
+    down = True
+    if started:
+        try:
+            stop_bridge(instance, workspace=workspace, kill=kill)
+        except ConnectionsError:
+            down = False
+    for r in rec["rows"]:
+        if restore_primary:
+            r["primary"] = r["instance"] == before
+        if r["instance"] == instance and was_parked and down:
+            r["parked"] = True
+    _write(record_path(workspace), rec)
+
+
+def _restart_secondary(undo: dict, start_kw: dict) -> None:
+    """After a rollback, outside the record lock (`launch` takes it): start again, as a secondary,
+    the bridge `promote` stopped to relaunch it."""
+    if undo["relaunched"]:
+        start(undo["instance"], **start_kw)
+
+
+def unpark(instance: str, *, repo: Path, logs_dir: Path, environ: Optional[Mapping[str, str]] = None,
+           workspace: Optional[Path] = None, vault=None, spawn=None, python: Optional[str] = None) -> dict:
+    """Clear the row's `parked` flag and, for a named row, `start` its bridge as a secondary (`launch`
+    in the row; None for the legacy row, whose launchers resume it, and for a disabled one).
+    Un-parking a row that is not parked only starts it. `''` also clears the parked legacy bridge
+    that has no row of its own (a bare `{"instance": ""}` comes back)."""
+    with _transaction(workspace) as rec:
+        if not instance:
+            rec[LEGACY_PARKED_KEY] = False
+        row = next((r for r in rec["rows"] if r["instance"] == instance), None)
+        if row is None and instance:
+            row = _find(rec["rows"], instance)
+        row = {"instance": "", "primary": False} if row is None else row
+        row.pop("parked", None)
+    out = dict(row)
+    out["launch"] = start_added(row, repo=repo, logs_dir=logs_dir, environ=environ, workspace=workspace,
+                                vault=vault, spawn=spawn, python=python)
     return out
 
 
@@ -1131,7 +1416,9 @@ def disconnect(instance: str, *, workspace: Optional[Path] = None, kill=None) ->
 
 def _enable(instance: str, workspace: Optional[Path]) -> None:
     with _transaction(workspace) as rec:
-        _find(rec["rows"], instance)["disabled"] = False
+        row = _find(rec["rows"], instance)
+        row["disabled"] = False
+        row.pop("parked", None)
 
 
 def env_token_vars(environ: Mapping[str, str]) -> list:
@@ -1225,11 +1512,14 @@ def _sidecar(instance: str, workspace: Optional[Path]) -> dict:
 
 
 def derive_state(sidecar: Mapping[str, object], launch: Mapping[str, object],
-                 disabled: bool = False) -> "tuple[str, Optional[str]]":
+                 disabled: bool = False, parked: bool = False) -> "tuple[str, Optional[str]]":
     """(state, reason) from the bridge's sidecar and the last launch record; a disabled row is
-    `parked` with reason `disabled` whatever a stale sidecar still says."""
+    `parked` with reason `disabled`, a row a primary move parked with reason `parked`, whatever a
+    stale sidecar still says."""
     if disabled:
         return "parked", "disabled"
+    if parked:
+        return "parked", "parked"
     if launch and launch.get("ok") is False:
         return "failed", str(launch.get("reason") or "launch_failed")
     if not sidecar:
@@ -1265,8 +1555,9 @@ def _writer_gone(sidecar: Mapping[str, object]) -> bool:
 
 def status_for(row: Mapping[str, object], workspace: Optional[Path] = None) -> dict:
     """The row plus `status` (connected, last_ok_ts from gateway-status), the derived `state`,
-    `running` (a bridge proven to hold the lease; None when the lease proves nothing) and every
-    optional field spelled out (`disabled` false, identity fields None when unknown)."""
+    `running` (a bridge proven to hold the lease; None when the lease proves nothing), `legacy` (the
+    environment's unsuffixed row, `legacy` on the HTTP path) and every optional field spelled out
+    (`disabled` and `parked` false, identity fields None when unknown)."""
     inst = str(row.get("instance") or "")
     sidecar = _sidecar(inst, workspace)
     if sidecar.get("connected") and _writer_gone(sidecar):
@@ -1274,9 +1565,11 @@ def status_for(row: Mapping[str, object], workspace: Optional[Path] = None) -> d
     launch = _read_json(launch_record_path(inst, workspace))
     out = dict(row)
     out["disabled"] = bool(row.get("disabled"))
+    out["parked"] = bool(row.get("parked"))
+    out["legacy"] = not inst
     for key in IDENTITY_FIELDS:
         out.setdefault(key, None)
-    state, reason = derive_state(sidecar, launch, out["disabled"])
+    state, reason = derive_state(sidecar, launch, out["disabled"], out["parked"])
     out["status"] = {"connected": bool(sidecar["connected"]) if "connected" in sidecar else None,
                      "last_ok_ts": sidecar.get("last_ok_ts")}
     out["state"] = state
@@ -1316,7 +1609,7 @@ def _stop_row(row: Mapping[str, object], workspace: Optional[Path], kill) -> int
 def launch_plan(environ: Optional[Mapping[str, str]] = None, *,
                 workspace: Optional[Path] = None) -> list:
     """One entry per bridge the plan launches: every enabled row with an instance (the legacy
-    unsuffixed bridge is the primary launch path's; a disabled row stays down), then any
+    unsuffixed bridge is the primary launch path's; a disabled or parked row stays down), then any
     AG2_REMOTE_TOKEN_<INST> still without a row (an import the vault refused) unless its row
     was removed. An unreadable record raises, so a caller never mistakes it for an empty plan."""
     environ = os.environ if environ is None else environ
@@ -1326,7 +1619,7 @@ def launch_plan(environ: Optional[Mapping[str, str]] = None, *,
     seen_inst = {r["instance"] for r in rows}
     seen_ref = {r["token_ref"] for r in rows} | set(record[REMOVED_KEY]) | {k for r in rows for k in r.get("launch_keys") or []}
     for r in rows:
-        if not r["instance"] or r.get("disabled"):
+        if not r["instance"] or r.get("disabled") or r.get("parked"):
             continue
         plan.append({"instance": r["instance"], "token_ref": r["token_ref"],
                      "channel_dir": channel_dir_for(r["instance"], environ), "primary": r["primary"]})
@@ -1342,7 +1635,7 @@ def plan_entry(instance: str, environ: Optional[Mapping[str, str]] = None, *,
                workspace: Optional[Path] = None, env_only: bool = False) -> dict:
     """The plan entry for `instance`; with `env_only`, built from AG2_REMOTE_TOKEN_<INST> alone
     (the fallback when the record cannot be read), never primary. A readable record still
-    refuses a row it marks disabled, in either mode."""
+    refuses a row it marks disabled or parked, in either mode."""
     environ = os.environ if environ is None else environ
     if env_only:
         try:
@@ -1350,8 +1643,9 @@ def plan_entry(instance: str, environ: Optional[Mapping[str, str]] = None, *,
         except (SchemaError, OSError):
             rows = []
         var = next((v for inst, v in env_token_vars(environ) if inst == instance), "")
-        if any(r.get("disabled") and (r["instance"] == instance or (var and r["token_ref"] == var)) for r in rows):
-            raise ConnectionsError(f"connection {instance!r} is disconnected; reconnect it to launch")
+        for r in rows:
+            if r["instance"] == instance or (var and r["token_ref"] == var):
+                _refuse_down(r)
         if not var:
             raise UnknownConnection(f"no AG2_REMOTE_TOKEN variable names {instance!r}")
         return {"instance": instance, "token_ref": var, "channel_dir": channel_dir_for(instance, environ),
@@ -1360,9 +1654,17 @@ def plan_entry(instance: str, environ: Optional[Mapping[str, str]] = None, *,
         if entry["instance"] == instance:
             return entry
     # The record as read, never list_connections: launch calls this under the record lock.
-    if any(r["instance"] == instance and r.get("disabled") for r in _read(record_path(workspace))):
-        raise ConnectionsError(f"connection {instance!r} is disconnected; reconnect it to launch")
+    for r in _read(record_path(workspace)):
+        if r["instance"] == instance:
+            _refuse_down(r)
     raise UnknownConnection(f"no connection {instance!r} to launch")
+
+
+def _refuse_down(row: Mapping[str, object]) -> None:
+    if row.get("disabled"):
+        raise ConnectionsError(f"connection {row['instance']!r} is disconnected; reconnect it to launch")
+    if row.get("parked"):
+        raise ConnectionsError(f"connection {row['instance']!r} is parked; unpark or promote it to launch")
 
 
 def _token_file(entry: Mapping[str, str], environ: Mapping[str, str]) -> str:
@@ -1606,8 +1908,9 @@ def _error_reason(e: Exception) -> str:
 
 def start_added(row: Mapping[str, object], **launch_kw) -> Optional[dict]:
     """After an add: `start` the row's bridge, so a saved connection is never left waiting for the
-    next restart. None for the legacy row (its launcher owns it) and for a disabled one (reconnect)."""
-    if not row.get("instance") or row.get("disabled"):
+    next restart. None for the legacy row (its launcher owns it), a disabled one (reconnect) and a
+    parked one (unpark)."""
+    if not row.get("instance") or row.get("disabled") or row.get("parked"):
         return None
     return start(str(row["instance"]), **launch_kw)
 
