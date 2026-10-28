@@ -916,18 +916,113 @@ class ListSelfHeals(ChannelFileBase):
         self.assertFalse(C.no_primary(self.ws))
         self.assertIsNone(hc.check_connections_primary(self.ws))
 
+    def _hc(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("hc_for_notes", Path(C.__file__).parent / "health-check.py")
+        hc = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(hc)
+        return hc
+
+    def test_a_list_that_makes_a_running_lane_primary_says_it_needs_a_relaunch_until_it_restarts(self):
+        """The flip can happen inside a GET; nothing is relaunched from a read, so the list and the
+        health check carry it until that bridge is replaced."""
+        self.write_relay_env(f"AG2_REMOTE_TOKEN_BETA={TOKEN_B}")
+        bridge = bridge_lease.start(self.ws, "beta")
+        try:
+            rows = [C.status_for(r, self.ws) for r in C.list_connections(self.ws, vault=self.vault)]
+            self.assertEqual([(r["instance"], r["primary"], r["relaunch_needed"]) for r in rows], [("beta", True, True)])
+            warn = self._hc().check_connections_primary(self.ws)
+            self.assertEqual(warn["status"], "warn")
+            self.assertIn("no proactive room until that bridge restarts", warn["detail"])
+        finally:
+            bridge_lease.stop(bridge)
+        self.assertFalse(C.status_for(self.rows()[0], self.ws)["relaunch_needed"], "no bridge: nothing to relaunch")
+        again = bridge_lease.start(self.ws, "beta")
+        try:
+            self.assertFalse(C.status_for(self.rows()[0], self.ws)["relaunch_needed"], "a restarted bridge has the room")
+            self.assertIsNone(self._hc().check_connections_primary(self.ws))
+        finally:
+            bridge_lease.stop(again)
+
+    def test_an_indeterminate_lease_at_the_flip_is_recorded_and_warns_until_a_lease_proves_a_holder(self):
+        indeterminate = C.BridgeLeaseIndeterminate("beta", "unreadable")
+        with unittest.mock.patch.object(C, "bridge_pid", side_effect=indeterminate):
+            created = C.import_from_env({"AG2_REMOTE_TOKEN_BETA": TOKEN_B}, workspace=self.ws, vault=self.vault)
+            self.assertEqual([(r["primary"], r["relaunch_needed"]) for r in created], [(True, True)])
+            self.assertEqual(json.loads(C.record_path(self.ws).read_text())[C.RELAUNCH_KEY], {"beta": C.LEASE_UNPROVEN})
+            self.assertTrue(C.status_for(self.rows()[0], self.ws)["relaunch_needed"])
+            self.assertEqual([lvl for lvl, _ in C.notes(self.ws)], ["warn"])
+        self.assertFalse(C.status_for(self.rows()[0], self.ws)["relaunch_needed"], "a provable lease ends it")
+
+    def test_a_relaunch_entry_off_the_primary_is_pruned_on_the_next_write(self):
+        C.import_from_env({"AG2_REMOTE_TOKEN_BETA": TOKEN_B}, workspace=self.ws, vault=self.vault)
+        rec = json.loads(C.record_path(self.ws).read_text())
+        rec[C.RELAUNCH_KEY] = {"beta": 4242, "gone": 99}
+        C.record_path(self.ws).write_text(json.dumps(rec))
+        C.import_from_env({"AG2_REMOTE_TOKEN_GAMMA": "https://chat.gamma-fixture.net|g"}, workspace=self.ws, vault=self.vault)
+        self.assertEqual(json.loads(C.record_path(self.ws).read_text())[C.RELAUNCH_KEY], {"beta": 4242})
+        C.set_primary("gamma", workspace=self.ws)
+        self.assertNotIn(C.RELAUNCH_KEY, json.loads(C.record_path(self.ws).read_text()), "the old primary's entry goes")
+
+    def test_a_malformed_relaunch_map_is_a_schema_error_and_readers_stay_quiet(self):
+        C.import_from_env({"AG2_REMOTE_TOKEN_BETA": TOKEN_B}, workspace=self.ws, vault=self.vault)
+        row = self.rows()[0]
+        rec = json.loads(C.record_path(self.ws).read_text())
+        rec[C.RELAUNCH_KEY] = {"beta": "not-a-pid"}
+        C.record_path(self.ws).write_text(json.dumps(rec))
+        with self.assertRaises(C.SchemaError):
+            C.list_connections(self.ws)
+        self.assertEqual(C.notes(self.ws), [], "an unreadable record says nothing")
+        rec[C.RELAUNCH_KEY] = {"beta": 1}
+        rec[C.LEGACY_PARKED_KEY] = "yes"
+        C.record_path(self.ws).write_text(json.dumps(rec))
+        with self.assertRaises(C.SchemaError):
+            C.list_connections(self.ws)
+        self.assertFalse(C.status_for(row, self.ws)["relaunch_needed"])
+
+    def test_list_prints_the_notes_under_its_table(self):
+        C.import_from_env({"AG2_REMOTE_TOKEN_DEV": TOKEN_B, "AG2_REMOTE_TOKEN_QA": "https://qa-fixture.net|q"},
+                          workspace=self.ws, vault=self.vault)
+        cli = Path(C.__file__).resolve().parents[1] / "scripts" / "connections.py"
+        out = subprocess.run([sys.executable, str(cli), "--workspace", str(self.ws), "list"], capture_output=True,
+                             text=True, env=isolated_child_env(SUTANDO_WORKSPACE=str(self.ws)))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("warn: no primary connection — choose one in Settings → Connections", out.stdout)
+
+    def test_a_legacy_row_that_is_not_primary_is_said_in_status_and_health(self):
+        C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A}, workspace=self.ws, vault=self.vault)
+        self.assertEqual(C.notes(self.ws), [], "the legacy row as primary needs no note")
+        C.import_from_env({"AG2_REMOTE_TOKEN_BETA": TOKEN_B}, workspace=self.ws, vault=self.vault)
+        C.set_primary("beta", workspace=self.ws)
+        [(level, text)] = C.notes(self.ws)
+        self.assertEqual(level, "info")
+        self.assertIn("legacy (unsuffixed) connection to alpha-fixture.net is not primary", text)
+        self.assertIn("`promote ''`", text)
+        info = self._hc().check_connections_primary(self.ws)
+        self.assertEqual((info["status"], info["detail"]), ("ok", text))
+
     def test_an_unsuffixed_candidate_keeps_the_primary_off_the_named_row(self):
         created = C.import_from_env({"REMOTE_TASK_TOKEN": TOKEN_A, "AG2_REMOTE_TOKEN_BETA": TOKEN_B},
                                     workspace=self.ws, vault=self.vault)
         self.assertEqual(sorted((r["instance"], r["primary"]) for r in created), [("", True), ("beta", False)])
 
     def test_a_legacy_bridge_configured_in_the_environment_keeps_the_primary_off_the_named_row(self):
-        for var, value in (("REMOTE_TASK_URL", "https://prod.example/relay"),
-                           ("REMOTE_TASK_TOKEN_FILE", "/tmp/prod.env"), ("AG2_REMOTE_URL", "https://p.example")):
-            with self.subTest(var=var):
-                ws = self.ws / var
-                created = C.import_from_env({"AG2_REMOTE_TOKEN_BETA": TOKEN_B, var: value}, workspace=ws, vault=self.vault)
+        legacy = {"url+token file": {"REMOTE_TASK_URL": "https://prod.example/relay", "REMOTE_TASK_TOKEN_FILE": "/tmp/p.env"},
+                  "token file": {"REMOTE_TASK_TOKEN_FILE": "/tmp/p.env"},
+                  "url+agent": {"REMOTE_TASK_URL": "https://prod.example/relay", "AGENT_ID": "@a:alpha-fixture.net"},
+                  "alt url+agent": {"AG2_REMOTE_URL": "https://p.example", "AGENT_ID": "@a:alpha-fixture.net"}}
+        for name, env in legacy.items():
+            with self.subTest(name):
+                created = C.import_from_env({"AG2_REMOTE_TOKEN_BETA": TOKEN_B, **env}, workspace=self.ws / name,
+                                            vault=self.vault)
                 self.assertEqual([(r["instance"], r["primary"]) for r in created], [("beta", False)])
+
+    def test_a_stale_relay_url_alone_does_not_hold_the_primary_back(self):
+        for var in ("REMOTE_TASK_URL", "AG2_REMOTE_URL"):
+            with self.subTest(var):
+                created = C.import_from_env({"AG2_REMOTE_TOKEN_BETA": TOKEN_B, var: "https://old.example/relay"},
+                                            workspace=self.ws / var, vault=self.vault)
+                self.assertEqual([(r["instance"], r["primary"]) for r in created], [("beta", True)])
 
     def test_a_named_row_beside_an_existing_one_never_takes_the_primary(self):
         C.import_from_env({"AG2_REMOTE_TOKEN_BETA": TOKEN_B}, workspace=self.ws, vault=self.vault)
