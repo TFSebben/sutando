@@ -910,18 +910,18 @@ def list_connections(workspace: Optional[Path] = None, *, vault=None) -> list:
     connect flow wrote after the engine started shows up on the next list. A record that exists
     but is empty is left alone: its rows were removed on purpose, and a lingering token must not
     bring them back. An import that fails is logged and the list still answers; a record that
-    fails validation raises as before. A record that exists still adopts the launch keys a host
-    wrote after it (`channel_launch_keys`), as `add_connection` does; a removed key stays removed."""
+    fails validation raises as before. Every list then adopts the launch keys a host wrote
+    (`channel_launch_keys`), as `add_connection` does; a removed key stays removed."""
     path = record_path(workspace)
     rows = _read(path)
-    if rows or path.exists():
-        return _read(path) if _adopt_launch_keys(rows, workspace, vault) else rows
-    try:
-        if import_from_env(workspace=workspace, vault=vault):
-            rows = _read(path)
-    except Exception as e:  # noqa: BLE001 - the list answers even when nothing could be imported
-        logging.getLogger(__name__).warning("connections: import on an empty record failed (%s)", type(e).__name__)
-    return rows
+    if not rows and not path.exists():
+        try:
+            if import_from_env(workspace=workspace, vault=vault):
+                rows = _read(path)
+        except Exception as e:  # noqa: BLE001 - the list answers even when nothing could be imported
+            logging.getLogger(__name__).warning("connections: import on an empty record failed (%s)", type(e).__name__)
+    # A desktop that signs in on a secondary homeserver first writes only its launch key.
+    return _read(path) if _adopt_launch_keys(rows, workspace, vault) else rows
 
 
 def _adopt_launch_keys(rows: list, workspace: Optional[Path], vault) -> bool:
@@ -979,10 +979,10 @@ def channel_launch_keys(environ: Optional[Mapping[str, str]] = None) -> dict:
     environ = os.environ if environ is None else environ
     found = {}
     try:
-        from channel_env_resolve import resolve_channel_env
+        from channel_env_resolve import resolve_launch_key_env
         from channel_token import token_from_env_file
         from util_paths import claude_home_path
-        path = resolve_channel_env(claude_home_path("channels"), "ag2space")
+        path = resolve_launch_key_env(claude_home_path("channels"), "ag2space")
         names = re.findall(r"^\s*(AG2_REMOTE_TOKEN_[A-Za-z0-9_]+)=", path.read_text(), re.M) if path else []
         found = {v: token_from_env_file(v, path) for v in names}
     except Exception:  # noqa: BLE001 - no channel home or an unreadable file is simply no keys
@@ -1140,6 +1140,16 @@ def primary_instance(workspace: Optional[Path] = None) -> Optional[str]:
         if row.get("primary"):
             return str(row.get("instance") or "")
     return None
+
+
+def no_primary(workspace: Optional[Path] = None) -> bool:
+    """Whether the record has rows but none is primary: then no bridge owns unaddressed proactive
+    messages or the owner's cards. Read only; an unreadable or missing record is False."""
+    try:
+        rows = _read(record_path(workspace))
+    except (SchemaError, OSError):
+        return False
+    return bool(rows) and not any(r["primary"] for r in rows)
 
 
 def legacy_keeps_proactive_room(workspace: Optional[Path] = None) -> bool:
@@ -1500,12 +1510,16 @@ def import_from_env(environ: Optional[Mapping[str, str]] = None, *,
     The REMOTE_TASK_TOKEN row comes from the environment, else from the channel env file the
     connect flow writes (`primary_token_from_channel_file`): a desktop install signs in after
     the engine started, so the token reaches the file but never this process's environment.
-    Env rows are unverified: the resolver's server when it knows the host, else the host. Only
-    the REMOTE_TASK_TOKEN row (the legacy unsuffixed bridge) can become primary, and only when
-    the install has none; a named env token never does, so no secondary ever inherits the
-    proactive room. A name whose row was removed is skipped until the variable is unset. The
-    secret is copied into the vault under the row's token_ref unless the vault already holds
-    one. Returns the rows created.
+    Env rows are unverified: the resolver's server when it knows the host, else the host. The
+    REMOTE_TASK_TOKEN row (the legacy unsuffixed bridge) becomes primary when the install has none.
+    A named env row becomes primary only when it is then the record's sole row, with no primary,
+    no unsuffixed row or candidate and no legacy bridge configured in the environment (a host
+    signed in only on a secondary homeserver); among
+    several none is picked, so no secondary inherits the proactive room by chance. That row
+    carries `relaunch_needed` when its bridge already runs, since it settled the proactive room
+    at launch. A name whose row was removed is skipped until the variable is unset. The secret
+    is copied into the vault under the row's token_ref unless the vault already holds one.
+    Returns the rows created.
     """
     environ = os.environ if environ is None else environ
     candidates = []
@@ -1540,8 +1554,41 @@ def import_from_env(environ: Optional[Mapping[str, str]] = None, *,
                        primary=(inst == "" and not any(r["primary"] for r in rows)), added_by="env",
                        verified=False, server_source="resolver" if resolved else "gateway")
             rows.append(row)
-            created.append(dict(row))
-    return created
+            created.append(row)
+        sole = _sole_named_primary(rows, candidates, environ)
+        if sole is not None and any(r is sole for r in created):
+            sole["primary"] = True
+    out = [dict(r) for r in created]
+    for r in out:
+        if r["primary"] and r["instance"]:
+            r["relaunch_needed"] = _bridge_running(r["instance"], workspace)
+    return out
+
+
+# Any of these configures the legacy unsuffixed bridge, which then keeps the proactive room.
+LEGACY_BRIDGE_ENV = ("REMOTE_TASK_TOKEN", "AG2_REMOTE_TOKEN", "REMOTE_TASK_URL", "AG2_REMOTE_URL",
+                     "REMOTE_TASK_TOKEN_FILE")
+
+
+def _sole_named_primary(rows: list, candidates: list, environ: Mapping[str, str]) -> Optional[dict]:
+    """The one named row that may take the primary: no primary, no unsuffixed row or candidate,
+    no legacy bridge configured in the environment, and it is the only row, enabled and not parked."""
+    if len(rows) != 1 or any(r["primary"] or not r["instance"] for r in rows):
+        return None
+    if any(not inst for inst, _ref, _tok in candidates):
+        return None
+    if any((environ.get(v) or "").strip() for v in LEGACY_BRIDGE_ENV):
+        return None
+    row = rows[0]
+    return None if row.get("disabled") or row.get("parked") else row
+
+
+def _bridge_running(instance: str, workspace: Optional[Path]) -> bool:
+    """Whether `instance`'s bridge holds its lease; a lease that proves nothing counts as running."""
+    try:
+        return bool(bridge_pid(instance, workspace))
+    except BridgeLeaseIndeterminate:
+        return True
 
 
 # ── status ───────────────────────────────────────────────────────────────────
