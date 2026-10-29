@@ -114,6 +114,8 @@ ALLOW: dict[str, "tuple[str, ...] | None"] = {
         "s.space refused the code",
         "s.space's answer",
     ),
+    "skills/tutorial/scripts/getting_started.py": ("A short tour of s.space",),
+    "skills/tutorial/scripts/tour_page.py": ("A short tour of s.space",),
 }
 
 TEST_FILE = re.compile(r"(^test_.*\.py$)|(_test\.py$)|(\.test\.(py|ts)$)")
